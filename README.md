@@ -84,17 +84,6 @@ with database(home) as db:
     print(monthly_report(db, "2026-04"))
 ```
 
-## Integración con AnalisisGastos
-
-El paquete instala el ejecutable `mp-gastos-analisis`. El script PowerShell de AnalisisGastos ya admite seleccionar el ejecutable mediante `ANALISIS_GASTOS_PYTHON`. Con el entorno de mp-gastos activado, estas instrucciones conectan el script de siempre al paquete para la sesión actual.
-
-```powershell
-$env:ANALISIS_GASTOS_PYTHON = (Get-Command mp-gastos-analisis).Source
-& 'RUTA\AnalisisGastos\scripts\run_mercadopago_sync.ps1'
-```
-
-El puente usa los métodos del paquete para consultar la cuenta, buscar y paginar compras, y consultar o crear tareas de reportes. La CLI original sigue manejando su base, importación, descarga, copias de respaldo, clasificación, salidas JSON y códigos de retorno. Conservá `MP_ACCESS_TOKEN` en el entorno tal como lo requiere AnalisisGastos. Para consultar los comandos por el puente, ejecutá `mp-gastos-analisis RUTA/AnalisisGastos/scripts/mercadopago.py --help`.
-
 ## Desarrollo
 
 ```console

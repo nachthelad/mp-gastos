@@ -18,7 +18,6 @@ Repository = "https://github.com/nachthelad/mp-gastos"
 
 [project.scripts]
 mp-gastos = "mp_gastos.cli:main"
-mp-gastos-analisis = "mp_gastos.legacy:main"
 
 [tool.setuptools.package-data]
 mp_gastos = ["rules.toml"]

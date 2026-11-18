@@ -40,15 +40,15 @@ class _NoRedirect(HTTPRedirectHandler):
         return None
 
 
-class Endpoints:
-    """Shared by the standalone client and the optional AnalisisGastos adapter."""
-
-    error_type = MercadoPagoError
+class MercadoPagoClient:
+    def __init__(self, *, env_file=Path(".env"), opener=None):
+        self._token = access_token(env_file)
+        self._open = opener or build_opener(_NoRedirect()).open
 
     def _object(self, method, path, payload=None):
         result = self._request_json(method, path, payload)
         if not isinstance(result, dict):
-            raise self.error_type("Expected an object from Mercado Pago.")
+            raise MercadoPagoError("Expected an object from Mercado Pago.")
         return result
 
     def get_report_config(self):
@@ -57,13 +57,13 @@ class Endpoints:
     def list_reports(self):
         rows = self._request_json("GET", REPORT + "/list")
         if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
-            raise self.error_type("Invalid report list.")
+            raise MercadoPagoError("Invalid report list.")
         return rows
 
     def create_report(self, *, begin_date, end_date):
         task = self._object("POST", REPORT, {"begin_date": begin_date, "end_date": end_date})
         if not (task.get("id") or task.get("report_id")):
-            raise self.error_type("Missing report task ID.")
+            raise MercadoPagoError("Missing report task ID.")
         return task
 
     def get_report_task(self, task_id):
@@ -72,7 +72,7 @@ class Endpoints:
     def get_user_id(self):
         payer = str(self._object("GET", "/users/me").get("id"))
         if not payer.isdigit():
-            raise self.error_type("Missing payer ID.")
+            raise MercadoPagoError("Missing payer ID.")
         return payer
 
     def search_card_payments(self, payer_id, payment_type, begin_date, end_date):
@@ -88,13 +88,13 @@ class Endpoints:
             page = self._object("GET", "/v1/payments/search?" + query)
             rows, paging = page.get("results"), page.get("paging")
             if not isinstance(rows, list) or not isinstance(paging, dict):
-                raise self.error_type("Invalid payment search result.")
+                raise MercadoPagoError("Invalid payment search result.")
             total = paging.get("total")
             if not isinstance(total, int) or total < 0 or paging.get("offset") != offset:
-                raise self.error_type("Inconsistent payment pagination.")
+                raise MercadoPagoError("Inconsistent payment pagination.")
             for row in rows:
                 if not isinstance(row, dict):
-                    raise self.error_type("Malformed payment.")
+                    raise MercadoPagoError("Malformed payment.")
                 nested = row.get("payer") or {}
                 payers = (row.get("payer_id"), nested.get("id") if isinstance(nested, dict) else None)
                 if ({str(p) for p in payers if p is not None} == {str(payer_id)}
@@ -106,13 +106,7 @@ class Endpoints:
             if offset >= total:
                 return
             if not rows:
-                raise self.error_type("Incomplete payment page.")
-
-
-class MercadoPagoClient(Endpoints):
-    def __init__(self, *, env_file=Path(".env"), opener=None):
-        self._token = access_token(env_file)
-        self._open = opener or build_opener(_NoRedirect()).open
+                raise MercadoPagoError("Incomplete payment page.")
 
     def _request(self, method, path, payload=None):
         request = Request(API + path, method=method,
