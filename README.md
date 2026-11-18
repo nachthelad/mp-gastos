@@ -1,6 +1,6 @@
 # mp-gastos
 
-Llevá un registro local de tus gastos de Mercado Pago en Argentina. Podés importar el reporte **Todas las transacciones**, consultar tus compras con tarjeta, revisar movimientos y generar un resumen mensual en Markdown. Los datos se guardan en SQLite en tu computadora. El paquete requiere Python 3.11 o superior.
+Llevá un registro local de tus gastos de MercadoPago de Argentina. Podés importar el reporte **Todas las transacciones**, consultar tus compras con tarjeta, revisar movimientos y generar un resumen mensual en Markdown. Los datos se guardan en SQLite en tu computadora. El paquete requiere Python 3.11 o superior.
 
 ## Instalación
 
