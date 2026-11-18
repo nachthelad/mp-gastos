@@ -2,16 +2,18 @@
 
 import argparse
 import csv
+import json
 import sqlite3
 import sys
 from datetime import datetime
 from pathlib import Path
 
 from .client import MercadoPagoClient, MercadoPagoError
-from .ledger import classify_movement, database, import_report, initialize, reconcile, review_queue
-from .report import money, monthly_report
-from .settlements import ARGENTINA, KINDS, load_rules
-from .sync import sync
+from .ledger import (classify_movement, database, import_reconciliations, import_report, initialize,
+                     reconcile, review_queue)
+from .report import money, monthly_data, monthly_report
+from .settlements import ARGENTINA, KINDS, load_issuers, load_rules
+from .sync import DEFAULT_WAIT, sync
 
 
 def parser():
@@ -22,20 +24,25 @@ def parser():
     update = cmds.add_parser("sync", help="Sync API data or import a downloaded settlement")
     update.add_argument("--month", help="Last calendar month, YYYY-MM (default: this month)")
     update.add_argument("--months", type=int, default=1)
-    update.add_argument("--wait", type=int, default=10, help="Seconds to wait for each report")
+    update.add_argument("--wait", type=int, default=DEFAULT_WAIT,
+                        help="Seconds to wait for each report (default: %(default)s)")
     update.add_argument("--csv", type=Path, help="Import this settlement offline")
     review = cmds.add_parser("review", help="List pending movements or classify one")
     review.add_argument("--id", type=int)
     review.add_argument("--kind", choices=KINDS)
     review.add_argument("--category")
+    review.add_argument("--json", action="store_true")
     match = cmds.add_parser("reconcile", help="Match a card purchase to a statement line")
-    match.add_argument("--payment", required=True)
-    match.add_argument("--line", required=True)
-    match.add_argument("--amount", required=True, help="Positive statement line amount")
-    match.add_argument("--currency", required=True)
-    report = cmds.add_parser("report", help="Write the monthly Markdown report")
+    mode = match.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--payment")
+    mode.add_argument("--import", dest="import_path", type=Path, help="CSV of matched statement lines")
+    match.add_argument("--line")
+    match.add_argument("--amount", help="Positive statement line amount")
+    match.add_argument("--currency")
+    report = cmds.add_parser("report", help="Write the monthly report as Markdown or JSON")
     report.add_argument("--month", required=True)
     report.add_argument("--output", type=Path)
+    report.add_argument("--json", action="store_true")
     return app
 
 
@@ -64,20 +71,42 @@ def main(argv=None):
                         return 2
             elif args.command == "review":
                 if args.id is None and args.kind is None and args.category is None:
-                    for r in review_queue(db):
-                        print(r["id"], r["date"], money(r["amount"]), r["currency"], r["description"], sep="\t")
+                    rows = review_queue(db)
+                    if args.json:
+                        print(json.dumps([{"id": r["id"], "date": r["date"], "source": r["source"],
+                                           "event": r["event"], "amount_cents": r["amount"],
+                                           "currency": r["currency"], "description": r["description"]}
+                                          for r in rows], ensure_ascii=False))
+                    else:
+                        for r in rows:
+                            print(r["id"], r["date"], money(r["amount"]), r["currency"], r["description"], sep="\t")
                 elif args.id is not None and args.kind and args.category:
                     classify_movement(db, args.id, args.kind, args.category)
+                    if args.json:
+                        print(json.dumps({"id": args.id, "kind": args.kind, "category": args.category.strip()},
+                                         ensure_ascii=False))
                 else:
                     raise ValueError("Supply --id, --kind and --category together.")
             elif args.command == "reconcile":
-                reconcile(db, args.payment, args.line, args.amount, args.currency)
+                if args.import_path:
+                    if any(v is not None for v in (args.line, args.amount, args.currency)):
+                        raise ValueError("Supply statement lines in the import file.")
+                    import_reconciliations(db, args.import_path)
+                elif args.line and args.amount and args.currency:
+                    reconcile(db, args.payment, args.line, args.amount, args.currency)
+                else:
+                    raise ValueError("Supply --line, --amount and --currency with --payment.")
             elif args.command == "report":
-                content = monthly_report(db, args.month)
+                issuers = load_issuers(args.home / "rules.toml")
+                if args.json:
+                    content = json.dumps(monthly_data(db, args.month, issuers), ensure_ascii=False, indent=2) + "\n"
+                else:
+                    content = monthly_report(db, args.month, issuers)
                 if args.output:
                     # Refuse to overwrite the ledger, rules or credentials by accident.
-                    if args.output.suffix.lower() != ".md":
-                        raise ValueError("Use a .md output file.")
+                    suffix = ".json" if args.json else ".md"
+                    if args.output.suffix.lower() != suffix:
+                        raise ValueError(f"Use a {suffix} output file.")
                     args.output.write_text(content, encoding="utf-8")
                 else:
                     sys.stdout.write(content)

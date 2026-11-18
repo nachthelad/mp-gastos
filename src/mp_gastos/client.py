@@ -14,6 +14,20 @@ REPORT = "/v1/account/settlement_report"
 CARD_TYPES = ("credit_card", "debit_card")
 
 
+def report_task_id(report):
+    # Older list responses distinguish the task_id from the generated report id.
+    return str(report.get("task_id") or report.get("id") or report.get("report_id") or "")
+
+
+def ready_files(report):
+    if str(report.get("status")).lower() not in ("processed", "available"):
+        return []
+    if report.get("file_name"):
+        return [report["file_name"]]
+    return [f["name"] for f in report.get("files") or []
+            if isinstance(f, dict) and isinstance(f.get("name"), str) and f["name"].lower().endswith(".csv")]
+
+
 class MercadoPagoError(RuntimeError):
     def __init__(self, message, *, status=None):
         super().__init__(message)
@@ -62,7 +76,7 @@ class MercadoPagoClient:
 
     def create_report(self, *, begin_date, end_date):
         task = self._object("POST", REPORT, {"begin_date": begin_date, "end_date": end_date})
-        if not (task.get("id") or task.get("report_id")):
+        if not report_task_id(task):
             raise MercadoPagoError("Missing report task ID.")
         return task
 

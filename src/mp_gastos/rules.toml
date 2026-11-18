@@ -1,3 +1,6 @@
+[issuers]
+# "71" = "Banco de ejemplo"
+
 # Rules are evaluated in order. Categories can be freely renamed.
 [[rule]]
 field = "external_reference"

@@ -49,12 +49,25 @@ def normalize(value):
                    if not unicodedata.combining(c)).strip()
 
 
-def load_rules(path):
+def _load_config(path):
     with path.open("rb") as stream:
         config = tomllib.load(stream)
-    if config.keys() - {"rule"}:
+    if config.keys() - {"rule", "issuers"}:
         raise ValueError("Unknown rules file section.")
-    rules = config.get("rule", [])
+    return config
+
+
+def load_issuers(path):
+    issuers = _load_config(path).get("issuers", {})
+    if not isinstance(issuers, dict) or not all(
+        isinstance(name, str) and name.strip() for name in issuers.values()
+    ):
+        raise ValueError("Expected issuer names in the [issuers] table.")
+    return issuers
+
+
+def load_rules(path):
+    rules = _load_config(path).get("rule", [])
     if not isinstance(rules, list):
         raise ValueError("Expected a list of [[rule]] sections.")
     for rule in rules:

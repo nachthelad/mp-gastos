@@ -1,5 +1,6 @@
 import csv
 import io
+import json
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -85,3 +86,66 @@ class LedgerTests(unittest.TestCase):
             self.assertEqual(run("review", "--kind", "transfer"), 1)
             self.assertEqual(run("report", "--month", "2026-04", "--output", str(output)), 0)
         self.assertIn("| ARS | 14,80 |", output.read_text(encoding="utf-8"))
+
+    def cli(self, *args, expected=0):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            status = main(["--home", str(self.home), *args])
+        self.assertEqual(status, expected, err.getvalue())
+        return out.getvalue()
+
+    def test_json_review(self):
+        self.assertEqual(json.loads(self.cli("review", "--json")), [])
+        self.cli("sync", "--csv", str(FIXTURE))
+        rows = json.loads(self.cli("review", "--json"))
+        row = next(r for r in rows if r["source"] == "71005")
+        self.assertEqual((row["amount_cents"], row["currency"], row["description"]),
+                         (-800, "ARS", "Molino de cartón"))
+        updated = json.loads(self.cli("review", "--json", "--id", str(row["id"]), "--kind", "purchase",
+                                      "--category", "Materiales"))
+        self.assertEqual(updated["category"], "Materiales")
+        self.assertNotIn(row, json.loads(self.cli("review", "--json")))
+
+    def test_import_reconciliations_and_report_formats(self):
+        with self.db:
+            self.db.executemany("INSERT INTO cards VALUES(?,?,?,?,?,?,?,1)", [
+                ("71002", "2026-04-10", "71", "ARS", 2345, "Cometas", "credit_card"),
+                ("71006", "2026-04-12", "72", "USD", 500, "Luna", "credit_card")])
+        (self.home / "rules.toml").write_text('[issuers]\n"71" = "Banco de cartón"\n', encoding="utf-8")
+        self.cli("sync", "--csv", str(FIXTURE))
+        batch = self.home / "lines.csv"
+        batch.write_text('payment,line\n71002,"Resumen, línea 3"\n', encoding="utf-8-sig")
+        for _ in range(2):
+            self.cli("reconcile", "--import", str(batch))
+        batch.write_text("payment,line,amount,currency\n71006,Cuota-1,2.00,USD\n", encoding="utf-8")
+        self.cli("reconcile", "--import", str(batch))
+        args = ("report", "--month", "2026-04")
+        data = json.loads(self.cli(*args, "--json"))
+        self.assertEqual(data["totals"], [
+            {"currency": "ARS", "total_cents": 2345, "matched_cents": 2345, "to_add_cents": 0},
+            {"currency": "USD", "total_cents": 500, "matched_cents": 200, "to_add_cents": 300}])
+        for key in ("cards", "issuers"):
+            self.assertEqual([(r["issuer_id"], r["issuer"]) for r in data[key]],
+                             [("71", "Banco de cartón"), ("72", "72")])
+        markdown = self.cli(*args)
+        self.assertIn("| Banco de cartón | ARS | 1 | 23,45 |", markdown)
+        self.assertIn("| 71006 | Luna | 72 | USD | 5,00 | 2,00 |", markdown)
+        self.assertIn("| ARS | 23,45 | 23,45 | 0,00 |", markdown)
+        output = self.home / "report.json"
+        self.cli(*args, "--json", "--output", str(output))
+        self.assertEqual(json.loads(output.read_text(encoding="utf-8")), data)
+
+    def test_invalid_batch_rolls_back_and_can_be_retried(self):
+        with self.db:
+            self.db.execute("INSERT INTO cards VALUES('71002','2026-04-10','71','ARS',2345,'','credit_card',1)")
+        batch = self.home / "lines.csv"
+        first = "payment,line,amount,currency\n71002,Cuota-1,12,ARS\n"
+        for invalid in ("71002,Cuota-1,11,ARS", "71002,Cuota-2,12,ARS", "71002,Cuota-2,11,USD",
+                        "71003,Cuota-2,11,ARS", "71002,Cuota-2", "71002,Cuota-2,1,ARS,extra"):
+            with self.subTest(invalid=invalid):
+                batch.write_text(first + invalid, encoding="utf-8")
+                self.cli("reconcile", "--import", str(batch), expected=1)
+                self.assertEqual(self.db.execute("SELECT count(*) FROM statement_lines").fetchone()[0], 0)
+        batch.write_text(first + "71002,Cuota-2,11.45,ARS", encoding="utf-8")
+        self.cli("reconcile", "--import", str(batch))
+        self.assertEqual(self.db.execute("SELECT sum(amount) FROM statement_lines").fetchone()[0], 2345)

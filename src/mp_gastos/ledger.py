@@ -1,5 +1,6 @@
 """Local ledger. Monetary columns hold integer cents."""
 
+import csv
 import sqlite3
 from contextlib import contextmanager
 
@@ -54,6 +55,10 @@ def database(home, *, create=False):
 
 
 def import_report(db, payload, rules):
+    import_reports(db, (payload,), rules)
+
+
+def import_reports(db, payloads, rules):
     with db:
         db.executemany("""
             INSERT INTO movements(identity,source,date,event,amount,currency,description,kind,category)
@@ -62,7 +67,7 @@ def import_report(db, payload, rules):
                 amount=excluded.amount, currency=excluded.currency,
                 kind=CASE WHEN reviewed THEN kind ELSE excluded.kind END,
                 category=CASE WHEN reviewed THEN category ELSE excluded.category END
-        """, parse_report(payload, rules))
+        """, (row for payload in payloads for row in parse_report(payload, rules)))
 
 
 def review_queue(db):
@@ -84,24 +89,48 @@ def classify_movement(db, movement, kind, category):
 
 
 def reconcile(db, payment, reference, amount, code):
-    reference = reference.strip()
-    value = cents(amount)
-    code = currency(code)
-    if not reference or value <= 0:
-        raise ValueError("Use a unique statement line reference and a positive amount.")
     with db:
         db.execute("BEGIN IMMEDIATE")
-        existing = db.execute("SELECT payment,amount,currency FROM statement_lines WHERE reference=?",
-                              (reference,)).fetchone()
-        if existing:
-            if tuple(existing) != (payment, value, code):
-                raise ValueError("That statement reference already identifies a different line.")
-            return
-        card = db.execute("SELECT paid,currency FROM cards WHERE id=? AND active=1", (payment,)).fetchone()
-        if not card or card["paid"] is None or card["currency"] != code:
-            raise ValueError("Expected an active payment with a known total in the same currency.")
-        matched = db.execute("SELECT COALESCE(SUM(amount),0) FROM statement_lines WHERE payment=?",
-                             (payment,)).fetchone()[0]
-        if matched + value > card["paid"]:
-            raise ValueError("Statement lines exceed the buyer's total.")
-        db.execute("INSERT INTO statement_lines VALUES (?,?,?,?)", (reference, payment, value, code))
+        _reconcile_line(db, payment, reference, amount, code)
+
+
+def import_reconciliations(db, path):
+    with path.open(encoding="utf-8-sig", newline="") as stream, db:
+        reader = csv.DictReader(stream, strict=True)
+        fields = reader.fieldnames or []
+        if sorted(fields) not in (["line", "payment"], ["amount", "currency", "line", "payment"]):
+            raise ValueError("Expected payment,line or payment,line,amount,currency headers.")
+        db.execute("BEGIN IMMEDIATE")
+        for row in reader:
+            try:
+                if None in row or any(v is None or not v.strip() for v in row.values()):
+                    raise ValueError("Expected a value in every column.")
+                _reconcile_line(db, row["payment"].strip(), row["line"], row.get("amount"), row.get("currency"))
+            except ValueError as exc:
+                raise ValueError(f"Line {reader.line_num}: {exc}") from exc
+
+
+def _reconcile_line(db, payment, reference, amount, code):
+    reference = reference.strip()
+    card = db.execute("SELECT paid,currency,active FROM cards WHERE id=?", (payment,)).fetchone()
+    if amount is None:
+        if not card or card["paid"] is None:
+            raise ValueError("Expected a payment with a known total.")
+        value, code = card["paid"], card["currency"]
+    else:
+        value, code = cents(amount), currency(code)
+    if not reference or value <= 0:
+        raise ValueError("Use a unique statement line reference and a positive amount.")
+    existing = db.execute("SELECT payment,amount,currency FROM statement_lines WHERE reference=?",
+                          (reference,)).fetchone()
+    if existing:
+        if tuple(existing) != (payment, value, code):
+            raise ValueError("That statement reference already identifies a different line.")
+        return
+    if not card or not card["active"] or card["paid"] is None or card["currency"] != code:
+        raise ValueError("Expected an active payment with a known total in the same currency.")
+    matched = db.execute("SELECT COALESCE(SUM(amount),0) FROM statement_lines WHERE payment=?",
+                         (payment,)).fetchone()[0]
+    if matched + value > card["paid"]:
+        raise ValueError("Statement lines exceed the buyer's total.")
+    db.execute("INSERT INTO statement_lines VALUES (?,?,?,?)", (reference, payment, value, code))

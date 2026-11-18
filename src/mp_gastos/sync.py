@@ -5,9 +5,11 @@ import re
 import time
 from datetime import UTC, datetime, timedelta
 
-from .client import CARD_TYPES, REPORT, MercadoPagoError
-from .ledger import import_report
+from .client import CARD_TYPES, REPORT, MercadoPagoError, ready_files, report_task_id
+from .ledger import import_reports
 from .settlements import ARGENTINA, REQUIRED, cents, currency, load_rules, local_date
+
+DEFAULT_WAIT = 180
 
 
 def month_start(month):
@@ -89,10 +91,17 @@ def sync_cards(db, client, payer, start, end):
                     """, values)
 
 
+def _same_end(left, right):
+    left, right = local_date(left), local_date(right)
+    if left.microsecond and right.microsecond:
+        return left == right
+    return left.replace(microsecond=0) == right.replace(microsecond=0)
+
+
 def _matches_window(report, begin, end):
     try:
         return (local_date(report["begin_date"]) == local_date(begin)
-                and local_date(report["end_date"]) == local_date(end))
+                and _same_end(report["end_date"], end))
     except (KeyError, ValueError, TypeError):
         return False
 
@@ -104,26 +113,27 @@ def _sync_settlement(db, client, start, end, rules, wait):
     with db:
         db.execute("BEGIN IMMEDIATE")
         job = db.execute("SELECT * FROM jobs WHERE month=?", (month,)).fetchone()
-        if job and (not job["done"] or job["end_at"] == cutoff):
+        if job and (not job["done"] or _same_end(job["end_at"], cutoff)):
             task, cutoff = job["task"], job["end_at"]
         else:
             # Recover a server-accepted POST even if the previous response was lost.
             report = next((r for r in reports if _matches_window(r, begin, cutoff)
-                           and str(r.get("status")).lower() in ("processed", "pending", "processing")), None)
-            if report and (report.get("task_id") or report.get("file_name")):
-                task = str(report.get("task_id") or "")
+                           and str(r.get("status")).lower() in ("processed", "available", "pending", "processing")
+                           and (report_task_id(r) or ready_files(r))), None)
+            if report:
+                task = report_task_id(report)
             else:
                 response = client.create_report(begin_date=begin, end_date=cutoff)
-                task = str(response.get("id") or response["report_id"])
+                task = report_task_id(response)
             db.execute("INSERT OR REPLACE INTO jobs(month,task,end_at) VALUES(?,?,?)",
                        (month, task, cutoff))
     deadline = time.monotonic() + wait
     report_id = None
     while True:
         ready = next((r for r in reports if (_matches_window(r, begin, cutoff)
-                      or (task and str(r.get("task_id")) == task)
+                      or (task and report_task_id(r) == task)
                       or (report_id and str(r.get("report_id") or r.get("id")) == report_id))
-                      and str(r.get("status")).lower() == "processed" and r.get("file_name")), None)
+                      and ready_files(r)), None)
         if not ready and task:
             try:
                 ready = client.get_report_task(task)
@@ -134,12 +144,13 @@ def _sync_settlement(db, client, start, end, rules, wait):
                     raise
                 ready = None
         state = str((ready or {}).get("status")).lower()
-        if state == "processed" and ready.get("file_name"):
-            import_report(db, client.download_report(ready["file_name"]), rules)
+        files = ready_files(ready or {})
+        if files:
+            import_reports(db, (client.download_report(name) for name in files), rules)
             with db:
                 db.execute("UPDATE jobs SET done=1 WHERE month=? AND end_at=? AND task=?",
                            (month, cutoff, task))
-            return "imported" if cutoff == api_date(end) else "catch_up"
+            return "imported" if _same_end(cutoff, api_date(end)) else "catch_up"
         if state in ("failed", "error", "cancelled", "canceled"):
             with db:
                 db.execute("DELETE FROM jobs WHERE month=? AND task=? AND end_at=?", (month, task, cutoff))
@@ -151,7 +162,7 @@ def _sync_settlement(db, client, start, end, rules, wait):
         reports = client.list_reports()
 
 
-def sync(db, client, month, *, months=1, rules_path, wait=10, now=None):
+def sync(db, client, month, *, months=1, rules_path, wait=DEFAULT_WAIT, now=None):
     if wait < 0:
         raise ValueError("Wait time must be nonnegative.")
     periods = list(windows(month, months, now or datetime.now(UTC)))
