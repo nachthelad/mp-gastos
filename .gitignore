@@ -1,0 +1,15 @@
+.env
+.env.*
+!.env.example
+.mp-gastos/
+*.csv
+!tests/fixtures/*.csv
+*.sqlite*
+*.db
+.venv*/
+__pycache__/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/

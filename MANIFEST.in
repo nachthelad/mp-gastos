@@ -1,0 +1,3 @@
+include .env.example
+include tests/fixtures/settlement.csv
+include tests/fixtures/payments.json
