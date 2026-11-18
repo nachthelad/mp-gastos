@@ -1,0 +1,41 @@
+# Rules are evaluated in order. Categories can be freely renamed.
+[[rule]]
+field = "external_reference"
+contains = "ccpaymentprod_"
+kind = "card_payment"
+category = "Tarjeta"
+direction = "debit"
+
+[[rule]]
+field = "transaction_type"
+contains = "TRANSFER"
+kind = "transfer"
+category = "Transferencias"
+
+[[rule]]
+field = "transaction_type"
+contains = "YIELD"
+kind = "yield"
+category = "Rendimientos"
+direction = "credit"
+
+[[rule]]
+field = "transaction_type"
+contains = "REFUND"
+kind = "refund"
+category = "Devoluciones"
+direction = "credit"
+
+[[rule]]
+field = "transaction_type"
+contains = "FEE"
+kind = "fee"
+category = "Comisiones"
+direction = "debit"
+
+[[rule]]
+field = "description"
+contains = "librería"
+kind = "purchase"
+category = "Libros"
+direction = "debit"

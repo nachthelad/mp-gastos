@@ -1,0 +1,4 @@
+[
+  {"id":71002,"payer":{"id":430},"status":"approved","operation_type":"regular_payment","payment_type_id":"credit_card","transaction_amount":20,"transaction_details":{"total_paid_amount":23.45},"issuer_id":"71","currency_id":"ARS","description":"Taller de cometas","date_created":"2026-04-10T11:00:00-03:00"},
+  {"id":71006,"payer_id":430,"status":"approved","operation_type":"regular_payment","payment_type_id":"debit_card","transaction_amount":5,"transaction_details":{"total_paid_amount":5},"issuer_id":"71","currency_id":"USD","description":"Papel lunar","date_created":"2026-04-12T15:00:00-03:00"}
+]
