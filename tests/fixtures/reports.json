@@ -1,0 +1,28 @@
+{
+  "list_processed": {
+    "id": 301,
+    "report_id": null,
+    "begin_date": "2026-04-01T03:00:00Z",
+    "end_date": "2026-05-01T02:59:59Z",
+    "status": "processed",
+    "file_name": "fictional.csv"
+  },
+  "list_processing": {
+    "id": 301,
+    "report_id": null,
+    "begin_date": "2026-04-01T03:00:00Z",
+    "end_date": "2026-05-01T02:59:59Z",
+    "status": "processing",
+    "file_name": null
+  },
+  "task_available": {
+    "id": 301,
+    "status": "available",
+    "files": [{"type": "csv", "name": "fictional.csv"}]
+  },
+  "task_processed": {
+    "status": "processed",
+    "report_id": 901,
+    "file_name": "fictional.csv"
+  }
+}

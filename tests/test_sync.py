@@ -2,7 +2,9 @@ import io
 import json
 import os
 import unittest
+from contextlib import redirect_stdout
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -10,6 +12,7 @@ from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlsplit
 
 from mp_gastos.client import REPORT, MercadoPagoClient, MercadoPagoError, access_token
+from mp_gastos.cli import main, parser
 from mp_gastos.ledger import database, initialize
 from mp_gastos.sync import sync, windows
 
@@ -22,6 +25,10 @@ class Server:
 
     def __init__(self):
         self.cards = json.loads((FIXTURES / "payments.json").read_text(encoding="utf-8"))
+        self.fixtures = json.loads((FIXTURES / "reports.json").read_text())
+        self.list_rows = []
+        self.task_reply = None
+        self.task_lookups = 0
         self.config = {}
         self.tasks = []
         self.ready = False
@@ -42,7 +49,7 @@ class Server:
                 self.config = json.loads(request.data)
             reply = self.config
         elif url.path == REPORT + "/list":
-            reply = []
+            reply = self.list_rows
             if self.visible:
                 reply = [dict(**self.tasks[-1], task_id=301, id=901, status="processed",
                               file_name="fictional.csv")]
@@ -51,9 +58,12 @@ class Server:
             self.tasks.append(json.loads(request.data))
             reply = {"id": 301}
         elif url.path == REPORT + "/task/301":
+            self.task_lookups += 1
             reply = {"status": "processing"}
             if self.ready:
-                reply = {"status": "processed", "report_id": 901, "file_name": "fictional.csv"}
+                reply = self.fixtures["task_processed"]
+            if self.task_reply is not None:
+                reply = self.task_reply
             if self.terminal:
                 reply = {"status": "failed"}
         elif url.path == REPORT + "/fictional.csv":
@@ -105,6 +115,65 @@ class SyncTests(unittest.TestCase):
         self.assertEqual([tuple(r) for r in self.db.execute("SELECT id,paid FROM cards ORDER BY id")],
                          [("71002", 2345), ("71006", 500)])
         self.assertEqual(self.db.execute("SELECT count(*) FROM movements").fetchone()[0], 6)
+
+    def test_discover_report_with_truncated_end_without_post(self):
+        self.server.list_rows = [self.server.fixtures["list_processed"]]
+        self.assertEqual(self.run_sync(), {"2026-04": "imported"})
+        self.assertEqual(tuple(self.db.execute("SELECT task,done FROM jobs").fetchone()), ("301", 1))
+        self.assertEqual(self.server.tasks, [])
+        self.assertEqual(self.server.task_lookups, 0)
+        self.assertEqual(self.db.execute("SELECT count(*) FROM movements").fetchone()[0], 6)
+
+    def test_discover_task_by_list_id_then_download_nested_name(self):
+        self.server.list_rows = [self.server.fixtures["list_processing"]]
+        self.server.task_reply = self.server.fixtures["task_available"]
+        self.assertEqual(self.run_sync(), {"2026-04": "imported"})
+        self.assertEqual(self.server.tasks, [])
+        self.assertEqual(self.server.task_lookups, 1)
+        self.assertEqual(self.db.execute("SELECT count(*) FROM movements").fetchone()[0], 6)
+
+    def test_pending_job_finds_list_file_by_id(self):
+        self.run_sync()
+        row = self.server.fixtures["list_processed"].copy()
+        del row["end_date"]
+        self.server.list_rows = [row]
+        self.assertEqual(self.run_sync(), {"2026-04": "imported"})
+        self.assertEqual(self.server.task_lookups, 1)
+        self.assertEqual(len(self.server.tasks), 1)
+
+    def test_other_cutoff_in_same_day_is_a_different_report(self):
+        self.server.list_rows = [dict(self.server.fixtures["list_processed"], id=401,
+                                      end_date="2026-05-01T02:59:58Z")]
+        self.assertEqual(self.run_sync(), {"2026-04": "pending"})
+        self.assertEqual(len(self.server.tasks), 1)
+
+    def test_saved_end_without_milliseconds_resumes_same_window(self):
+        with self.db:
+            self.db.execute("INSERT INTO jobs VALUES('2026-04','301','2026-05-01T02:59:59Z',1)")
+        self.server.task_reply = self.server.fixtures["task_available"]
+        self.assertEqual(self.run_sync(), {"2026-04": "imported"})
+        self.assertEqual(self.server.tasks, [])
+        self.assertEqual(self.server.task_lookups, 1)
+
+    def test_failure_in_second_csv_rolls_back_the_first(self):
+        self.server.task_reply = {"status": "available", "files": [
+            {"name": "fictional.csv"}, {"name": "incomplete.csv"}]}
+        with patch.object(self.client, "download_report", side_effect=[
+                (FIXTURES / "settlement.csv").read_bytes(), b"bad headers"]):
+            with self.assertRaisesRegex(ValueError, "headers"):
+                self.run_sync()
+        self.assertEqual(self.db.execute("SELECT count(*) FROM movements").fetchone()[0], 0)
+        self.assertEqual(self.db.execute("SELECT done FROM jobs").fetchone()[0], 0)
+
+    def test_cli_pending_then_available(self):
+        self.assertEqual(parser().parse_args(["sync"]).wait, 180)
+        args = ["--home", str(self.home), "sync", "--month", "2026-04", "--wait", "0"]
+        with patch("mp_gastos.cli.MercadoPagoClient", return_value=self.client), \
+             patch("mp_gastos.cli.sync", partial(sync, now=NOW)), redirect_stdout(io.StringIO()):
+            self.assertEqual(main(args), 2)
+            self.server.task_reply = self.server.fixtures["task_available"]
+            self.assertEqual(main(args), 0)
+        self.assertEqual(len(self.server.tasks), 1)
 
     def test_partial_pages_preserve_previous_month_snapshot(self):
         self.run_sync()

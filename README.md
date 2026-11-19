@@ -32,6 +32,8 @@ mp-gastos sync --month 2026-04 --months 3
 mp-gastos review
 mp-gastos review --id 6 --kind purchase --category "Materiales"
 mp-gastos report --month 2026-04 --output abril.md
+mp-gastos report --month 2026-04 --json --output abril.json
+mp-gastos review --json
 ```
 
 `--month` indica el último mes a consultar. El segundo ejemplo recorre febrero, marzo y abril. Elegí fechas entre el mes actual y los once anteriores. Las ventanas siguen el horario argentino. Para probar el flujo sin credenciales, usá el CSV inventado del repositorio.
@@ -45,7 +47,9 @@ mp-gastos report --month 2026-04
 
 La sincronización consulta la configuración del reporte y solicita el período a Mercado Pago. Si la cuenta todavía carece de configuración, crea una con separador `;` y encabezados en inglés. Si ya tenés una, verificá que use ese separador y las columnas `SOURCE_ID`, `TRANSACTION_DATE`, `TRANSACTION_TYPE`, `TRANSACTION_CURRENCY` y `SETTLEMENT_NET_AMOUNT`. Agregá `DESCRIPTION`, `EXTERNAL_REFERENCE` y `PAYMENT_METHOD_TYPE` para aprovechar las reglas. La sincronización conserva la programación remota. [Reportes por API](https://www.mercadopago.com.ar/developers/es/docs/links-and-debts/additional-content/reports/account-money/api)
 
-Si MP demora, el comando devuelve código **2** y guarda la tarea. Volvé a correrlo con el mismo mes para retomar la descarga. Podés ajustar la espera por mes con `--wait 60`. El código **0** indica éxito y **1** indica un error operativo. Las compras con tarjeta se actualizan incluso si el reporte queda pendiente.
+El sync espera hasta **180 segundos** por reporte. Si sigue pendiente, devuelve código **2** y guarda la tarea. Volvé a correrlo con el mismo mes para retomar la descarga. Con `--wait 0` consulta una vez y devuelve el control. El código **0** indica éxito y **1** indica un error operativo. Las compras con tarjeta se actualizan incluso si el reporte queda pendiente.
+
+En la salida JSON de `report` y `review`, los campos que terminan en `_cents` expresan centavos enteros. En `report`, cada moneda tiene su propio `to_add_cents`, que corresponde a **Para sumar al resumen**. Cuando falta el total del comprador, `paid_cents` vale `null`.
 
 Cada regla de `.mp-gastos/rules.toml` define un campo, un texto a buscar, un tipo y una categoría libre. Podés restringirla a débitos o créditos. Se aplica la primera coincidencia, ignorando mayúsculas y acentos. Los movimientos ambiguos quedan en `review`. Al reimportar el reporte se vuelven a evaluar las reglas y se respetan tus decisiones manuales. Estos son los tipos disponibles.
 
@@ -57,6 +61,13 @@ purchase  transfer  card_payment  yield  fee  refund  withdrawal  other
 
 El informe lista los ID de pago y agrupa las compras por emisor y moneda. Toma el importe total pagado por el comprador, incluidos los cargos informados por MP. Cuando MP omite ese total, la compra aparece como pendiente de importe. Las transferencias, los rendimientos y el pago de la tarjeta quedan fuera del gasto de consumo.
 
+Para mostrar el nombre del emisor, cargá sus códigos en la tabla `[issuers]` de `.mp-gastos/rules.toml`. Si ya tenías un archivo de reglas, podés agregarle esta tabla. Los emisores sin nombre configurado se muestran con su código.
+
+```toml
+[issuers]
+"71" = "Banco de ejemplo"
+```
+
 Buscá el consumo en el resumen del emisor. Una vez identificado, ingresá el ID de pago de MP, una referencia única para esa línea, el importe del resumen y su moneda. Por ejemplo, para la primera cuota de una compra ficticia de ARS 23,45:
 
 ```console
@@ -66,6 +77,23 @@ mp-gastos report --month 2026-04
 
 Podés vincular otra cuota con su propia referencia. Repetir la misma línea es seguro. El informe asigna la compra al mes de la operación y muestra cuánto ya figura en los resúmenes vinculados, aunque lleguen después. Si llevás otro registro con los consumos del banco, agregale solo la columna **Para sumar al resumen**. En el ejemplo quedarían ARS 11,45 de la compra por conciliar. La tabla general también incluye los gastos confirmados de la cuenta. Si una compra con tarjeta aparece en el reporte de cuenta con el mismo ID, se cuenta una sola vez.
 
+Para cargar varias conciliaciones juntas, ejecutá `mp-gastos reconcile --import conciliaciones.csv`. Usá un CSV UTF-8 separado por comas. Si cada línea cubre la compra completa, alcanzan el ID del pago y una referencia única. El comando toma el total y la moneda de la compra sincronizada.
+
+```csv
+payment,line
+71002,Emisor71-2026-04-renglon08
+```
+
+Para cuotas o importes parciales, incluí las cuatro columnas en todo el archivo.
+
+```csv
+payment,line,amount,currency
+71002,Emisor71-2026-04-renglon08,12.00,ARS
+71002,Emisor71-2026-05-renglon03,11.45,ARS
+```
+
+Si hay una referencia en conflicto, una moneda distinta o un importe que excede el total de la compra, se descarta el lote completo. Podés corregir el archivo y volver a importarlo. Las líneas idénticas se cuentan una sola vez.
+
 ## Uso como librería
 
 ```python
@@ -74,6 +102,7 @@ from pathlib import Path
 from mp_gastos.client import MercadoPagoClient
 from mp_gastos.ledger import database, initialize
 from mp_gastos.report import monthly_report
+from mp_gastos.settlements import load_issuers
 from mp_gastos.sync import sync
 
 home = Path(".mp-gastos")
@@ -81,7 +110,7 @@ initialize(home)
 with database(home) as db:
     states = sync(db, MercadoPagoClient(), "2026-04", rules_path=home / "rules.toml")
     print(states)
-    print(monthly_report(db, "2026-04"))
+    print(monthly_report(db, "2026-04", load_issuers(home / "rules.toml")))
 ```
 
 ## Desarrollo
