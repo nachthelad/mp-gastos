@@ -9,21 +9,38 @@ import re
 import tomllib
 import unicodedata
 from collections import Counter
-from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
+from datetime import datetime, time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 ARGENTINA = timezone(timedelta(hours=-3))
-KINDS = ("purchase", "transfer", "card_payment", "yield", "fee", "refund", "withdrawal", "loan", "other")
+KINDS = ("purchase", "transfer", "transfer_in", "card_payment", "yield", "fee", "refund", "withdrawal",
+         "loan", "other")
 REQUIRED = {"SOURCE_ID", "TRANSACTION_DATE", "TRANSACTION_TYPE", "SETTLEMENT_NET_AMOUNT",
             "TRANSACTION_CURRENCY"}
 DETAIL_FIELDS = ("description", "external_reference", "payment_method_type", "counterparty", "impact_kind")
 FIELDS = {"transaction_type", *DETAIL_FIELDS}
-OPERATORS = {"contains", "exact", "prefix"}
+OPERATORS = {"contains", "exact", "prefix", "word"}
 DEFAULT_RULES = Path(__file__).with_name("rules.toml")
 YIELD_MARKER = re.compile(
     r"\b(rendimientos?|yield|investment interest|money market|asset management gain)\b"
 )
+
+
+@dataclass(frozen=True)
+class YieldHeuristic:
+    start: time
+    end: time
+    max_cents: int
+    category: str
+
+
+@dataclass(frozen=True)
+class ClassificationRules:
+    rules: list
+    yield_heuristic: YieldHeuristic | None = None
+    credit_fallback: str | None = None
 
 
 def cents(value):
@@ -63,7 +80,7 @@ def month_end(start):
 def _load_config(path):
     with path.open("rb") as stream:
         config = tomllib.load(stream)
-    if config.keys() - {"rule", "issuers"}:
+    if config.keys() - {"rule", "issuers", "yield_heuristic", "credit_fallback"}:
         raise ValueError("Unknown rules file section.")
     return config
 
@@ -78,8 +95,26 @@ def load_issuers(path):
     return {str(key): name for key, name in issuers.items()}
 
 
+def _classification_section(config, name, fields, default_category):
+    section = config.get(name, {})
+    if not isinstance(section, dict) or section.keys() - (fields | {"enabled", "category"}):
+        raise ValueError(f"Invalid [{name}] section.")
+    enabled = section.get("enabled", name in config)
+    category = section.get("category", default_category)
+    if not isinstance(enabled, bool) or not isinstance(category, str) or not category.strip():
+        raise ValueError(f"Expected a boolean enabled and a nonempty category in [{name}].")
+    return category.strip() if enabled else None
+
+
+def _clock(value):
+    if not isinstance(value, str) or not re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", value):
+        raise ValueError("Expected HH:MM in [yield_heuristic].")
+    return time.fromisoformat(value)
+
+
 def load_rules(path):
-    rules = _load_config(path).get("rule", [])
+    config = _load_config(path)
+    rules = config.get("rule", [])
     if not isinstance(rules, list):
         raise ValueError("Expected a list of [[rule]] sections.")
     for rule in rules:
@@ -90,13 +125,24 @@ def load_rules(path):
                 or not all(isinstance(rule.get(k), str) and normalize(rule[k])
                            for k in {"category"} | (OPERATORS & rule.keys()))):
             raise ValueError("Invalid classification rule.")
-    return rules
+    category = _classification_section(config, "yield_heuristic", {"start", "end", "max_amount"}, "Rendimientos")
+    heuristic = None
+    if category is not None:
+        section = config["yield_heuristic"]
+        if "max_amount" not in section or (limit := cents(section["max_amount"])) <= 0:
+            raise ValueError("Expected a positive max_amount in [yield_heuristic].")
+        heuristic = YieldHeuristic(_clock(section.get("start", "00:00")), _clock(section.get("end", "02:59")),
+                                   limit, category)
+    fallback = _classification_section(config, "credit_fallback", set(), "Transferencias recibidas")
+    return ClassificationRules(rules, heuristic, fallback)
 
 
 def classify(row, rules):
+    if not isinstance(rules, ClassificationRules):
+        rules = ClassificationRules(rules)
     amount = row["amount"]
     direction = "debit" if amount < 0 else "credit" if amount > 0 else "neutral"
-    for rule in rules:
+    for rule in rules.rules:
         if rule.get("direction", "any") not in ("any", direction):
             continue
         field = rule["field"]
@@ -106,7 +152,8 @@ def classify(row, rules):
         value = normalize(value)
         if (("contains" in rule and normalize(rule["contains"]) in value)
                 or ("exact" in rule and normalize(rule["exact"]) == value)
-                or ("prefix" in rule and value.startswith(normalize(rule["prefix"])))):
+                or ("prefix" in rule and value.startswith(normalize(rule["prefix"])))
+                or ("word" in rule and re.search(r"\b" + re.escape(normalize(rule["word"])) + r"\b", value))):
             return rule["kind"], rule["category"]
     if amount < 0 and normalize(row["external_reference"]).startswith(("ccpaymentprod_", "cctiprod-")):
         return "card_payment", "Tarjeta"
@@ -114,7 +161,33 @@ def classify(row, rules):
         for field in ("description", "counterparty", "external_reference", "impact_kind", "payment_method_type"):
             if YIELD_MARKER.search(normalize(row[field]).replace("_", " ").replace("-", " ")):
                 return "yield", "Rendimientos"
+        heuristic = rules.yield_heuristic
+        if (heuristic and amount <= heuristic.max_cents
+                and not any(normalize(row[field]) for field in ("description", "counterparty", "external_reference"))):
+            clock = local_date(row["date"]).time().replace(second=0, microsecond=0)
+            if heuristic.start <= heuristic.end:
+                in_window = heuristic.start <= clock <= heuristic.end
+            else:
+                in_window = clock >= heuristic.start or clock <= heuristic.end
+            if in_window:
+                return "yield", heuristic.category
+    if amount > 0 and rules.credit_fallback:
+        return "transfer_in", rules.credit_fallback
     return None, None
+
+
+def impact_kind(data):
+    value = data.get("impact_kind")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    metadata = data.get("metadata")
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except ValueError:
+            return ""
+    value = metadata.get("impact_kind") if isinstance(metadata, dict) else None
+    return value.strip() if isinstance(value, str) else ""
 
 
 def movement_identity(row, occurrences):
@@ -173,5 +246,7 @@ def parse_report(payload):
             raise ValueError("Missing settlement event type.")
         movement = dict(source=source, date=date, event=event, amount=amount, currency=code)
         movement.update({field: row.get(field.upper(), "") for field in DETAIL_FIELDS})
+        movement["impact_kind"] = impact_kind({"impact_kind": movement["impact_kind"],
+                                               "metadata": row.get("METADATA")})
         movement["identity"] = movement_identity(movement, occurrences)
         yield movement

@@ -10,6 +10,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
+from .settlements import impact_kind
+
 API = "https://api.mercadopago.com"
 REPORT = "/v1/account/settlement_report"
 CARD_TYPES = ("credit_card", "debit_card")
@@ -121,7 +123,8 @@ class MercadoPagoClient:
             name = (_label(other.get("name")) or
                     " ".join(filter(None, (_label(other.get("first_name")), _label(other.get("last_name"))))))
             return {"description": description,
-                    "counterparty": counterparty or name or description or str(other_id or "")}
+                    "counterparty": counterparty or name or description or str(other_id or ""),
+                    "impact_kind": impact_kind(payment)}
 
         return enrich
 

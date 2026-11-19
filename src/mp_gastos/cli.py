@@ -9,8 +9,8 @@ from datetime import datetime
 from pathlib import Path
 
 from .client import MercadoPagoClient, MercadoPagoError
-from .ledger import (classify_movement, daily_gap_count, database, import_reconciliations, import_reports,
-                     initialize, reclassify, reconcile, review_queue)
+from .ledger import (classify_movement, daily_gap_count, database, import_classifications,
+                     import_reconciliations, import_reports, initialize, reclassify, reconcile, review_queue)
 from .report import money, monthly_data, monthly_report
 from .settlements import ARGENTINA, KINDS, load_issuers, load_rules, month_end
 from .sync import DEFAULT_WAIT, month_start, sync
@@ -29,8 +29,10 @@ def parser():
     update.add_argument("--csv", type=Path, help="Import a monthly settlement CSV")
     update.add_argument("--daily-csv", type=Path, action="append", default=[],
                         help="Import a daily settlement CSV (repeat for multiple files)")
-    update.add_argument("--enrich", action="store_true", help="Look up missing counterparties for local CSVs")
+    update.add_argument("--enrich", action="store_true", help="Look up missing payment details for local CSVs")
     cmds.add_parser("reclassify", help="Reapply rules to movements without a manual classification")
+    classifications = cmds.add_parser("import-classifications", help="Import manual classifications by source ID")
+    classifications.add_argument("path", type=Path, metavar="FILE")
     review = cmds.add_parser("review", help="List pending movements or classify one")
     review.add_argument("--id", type=int)
     review.add_argument("--kind", choices=KINDS)
@@ -62,9 +64,10 @@ def main(argv=None):
                 rules = args.home / "rules.toml"
                 status_code = 0
                 if args.csv or args.daily_csv:
-                    if args.months != 1 or (args.month and not args.csv):
-                        raise ValueError("Use --months with API sync and --month with API sync or a monthly CSV.")
-                    end = month_end(month_start(args.month)).isoformat() if args.month else None
+                    if args.months != 1:
+                        raise ValueError("Use --months with API sync.")
+                    start = month_start(args.month) if args.month else None
+                    end = month_end(start).isoformat() if start and args.csv else None
                     enrich = None
                     if args.enrich:
                         client = MercadoPagoClient()
@@ -75,7 +78,7 @@ def main(argv=None):
                         enrich = client.payment_enricher(payer)
                     periods = import_reports(db, (args.csv.read_bytes(),) if args.csv else (), load_rules(rules),
                                              daily=(path.read_bytes() for path in args.daily_csv),
-                                             monthly_end=end, enrich=enrich)
+                                             daily_month=args.month, monthly_end=end, enrich=enrich)
                     print("Settlement imported.")
                 else:
                     if args.enrich:
@@ -97,6 +100,9 @@ def main(argv=None):
             elif args.command == "reclassify":
                 count = reclassify(db, load_rules(args.home / "rules.toml"))
                 print(f"Movimientos reclasificados: {count}.")
+            elif args.command == "import-classifications":
+                count = import_classifications(db, args.path)
+                print(f"Movimientos clasificados manualmente: {count}.")
             elif args.command == "review":
                 if args.id is None and args.kind is None and args.category is None:
                     rows = review_queue(db)

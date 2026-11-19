@@ -1,6 +1,19 @@
 [issuers]
 # 71 = "Banco de ejemplo"
 
+# Créditos SETTLEMENT sin descripción, contraparte ni referencia.
+[yield_heuristic]
+enabled = true
+start = "00:00"
+end = "02:59"
+max_amount = "1000.00"
+category = "Rendimientos"
+
+# Se aplica al final, después del rendimiento y de las reglas.
+[credit_fallback]
+enabled = true
+category = "Transferencias recibidas"
+
 # Rules are evaluated in order. Categories can be freely renamed.
 [[rule]]
 field = "external_reference"
@@ -49,3 +62,11 @@ contains = "librería"
 kind = "purchase"
 category = "Libros"
 direction = "debit"
+
+# Ejemplo para servicios. Repetí la regla para luz, agua o seguro si te sirve.
+# [[rule]]
+# field = "description"
+# word = "gas"
+# kind = "purchase"
+# category = "Servicios"
+# direction = "debit"
