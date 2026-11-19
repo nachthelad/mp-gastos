@@ -89,7 +89,7 @@ def import_report(db, payload, rules):
     import_reports(db, (payload,), rules)
 
 
-def import_reports(db, payloads, rules, *, daily=(), monthly_end=None, enrich=None):
+def import_reports(db, payloads, rules, *, daily=(), daily_month=None, monthly_end=None, enrich=None):
     if monthly_end is None:
         coverage = {}
     else:
@@ -101,6 +101,8 @@ def import_reports(db, payloads, rules, *, daily=(), monthly_end=None, enrich=No
         for payload in reports:
             for row in parse_report(payload):
                 month = row["date"][:7]
+                if origin == DAILY and daily_month is not None and month != daily_month:
+                    continue
                 months.add(month)
                 if origin == MONTHLY and monthly_end is None and month not in coverage:
                     coverage[month] = month_end(local_date(row["date"])).isoformat()
@@ -116,13 +118,14 @@ def import_reports(db, payloads, rules, *, daily=(), monthly_end=None, enrich=No
                 movements[identity] = row
 
     if enrich:
+        enrich_fields = ("counterparty", "impact_kind")
         for row in movements.values():
-            if not row["counterparty"]:
-                stored = db.execute("SELECT counterparty FROM movements WHERE identity=?",
+            if any(not row[field] for field in enrich_fields):
+                stored = db.execute("SELECT * FROM movements WHERE identity=?",
                                     (row["identity"],)).fetchone()
-                if not stored or not stored["counterparty"]:
+                if any(not row[field] and (not stored or not stored[field]) for field in enrich_fields):
                     for field, value in enrich(row["source"]).items():
-                        row[field] = row[field] or value
+                        row[field] = row[field] or (stored[field] if stored else "") or value
 
     with db:
         db.execute("BEGIN IMMEDIATE")
@@ -188,6 +191,35 @@ def classify_movement(db, movement, kind, category):
                             (kind, category.strip(), movement))
         if not result.rowcount:
             raise ValueError("Unknown movement ID.")
+
+
+def import_classifications(db, path):
+    """Apply a manual classification to every existing movement with the given source ID."""
+    with path.open(encoding="utf-8-sig", newline="") as stream, db:
+        reader = csv.DictReader(stream, strict=True)
+        if sorted(reader.fieldnames or []) != ["category", "kind", "source_id"]:
+            raise ValueError("Expected source_id,kind,category headers.")
+        db.execute("BEGIN IMMEDIATE")
+        seen = {}
+        count = 0
+        for row in reader:
+            line = reader.line_num
+            if None in row or any(value is None or not value.strip() for value in row.values()):
+                raise ValueError(f"Line {line}: expected a value in every column.")
+            source, kind, category = (row[field].strip() for field in ("source_id", "kind", "category"))
+            if kind not in KINDS:
+                raise ValueError(f"Line {line}: unknown classification kind.")
+            if source in seen:
+                if seen[source] != (kind, category):
+                    raise ValueError(f"Line {line}: conflicting classifications for the same source ID.")
+                continue
+            result = db.execute("UPDATE movements SET kind=?, category=?, reviewed=1 WHERE source=?",
+                                (kind, category, source))
+            if not result.rowcount:
+                raise ValueError(f"Line {line}: unknown source ID.")
+            seen[source] = kind, category
+            count += result.rowcount
+    return count
 
 
 def reconcile(db, payment, reference, amount, code):

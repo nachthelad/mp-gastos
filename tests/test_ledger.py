@@ -10,12 +10,14 @@ from tempfile import TemporaryDirectory
 from mp_gastos.cli import main
 from mp_gastos.ledger import (classify_movement, daily_gap_count, database, import_report, import_reports,
                              initialize, reconcile, review_queue)
-from mp_gastos.report import monthly_report
+from mp_gastos.report import monthly_data, monthly_report
 from mp_gastos.settlements import load_rules
 
 FIXTURE = Path(__file__).parent / "fixtures" / "settlement.csv"
 DAILY = FIXTURE.with_name("settlement-daily.csv")
 MONTHLY = FIXTURE.with_name("settlement-monthly.csv")
+BOUNDARY = FIXTURE.with_name("settlement-boundary.csv")
+CLASSIFICATIONS = FIXTURE.with_name("classifications.csv")
 
 
 class LedgerTests(unittest.TestCase):
@@ -64,7 +66,7 @@ category = "Inversiones"
 """, encoding="utf-8")
         movement = self.db.execute("SELECT id FROM movements WHERE source='72005'").fetchone()[0]
         classify_movement(self.db, movement, "purchase", "Manual")
-        self.assertIn("reclasificados: 3", self.cli("reclassify"))
+        self.assertIn("reclasificados: 4", self.cli("reclassify"))
         self.assertIn("reclasificados: 0", self.cli("reclassify"))
         for source, kind, category in (("72002", "loan", "Cuotas"), ("72003", "card_payment", "Tarjeta"),
                                        ("72004", None, None), ("72005", "purchase", "Manual")):
@@ -98,6 +100,75 @@ category = "Inversiones"
             import_reports(self.db, [MONTHLY.read_bytes()], self.rules, daily=[DAILY.read_bytes(), b"bad"])
         self.assertEqual(self.db.execute("SELECT count(*) FROM movements").fetchone()[0], 0)
         self.assertEqual(self.db.execute("SELECT count(*) FROM monthly_reports").fetchone()[0], 0)
+
+    def test_daily_month_filter_and_default_credit_order(self):
+        self.cli("sync", "--daily-csv", str(BOUNDARY), "--month", "2026-10")
+        rows = {row["source"]: row for row in self.db.execute("SELECT * FROM movements")}
+        self.assertEqual(set(rows), {str(n) for n in range(83002, 83015)} | {"83016"})
+        self.assertEqual(self.db.execute("SELECT count(*) FROM monthly_reports").fetchone()[0], 0)
+        self.assertEqual({source: row["kind"] for source, row in rows.items()}, {
+            "83002": "yield", "83003": "yield", "83004": "transfer_in", "83005": "transfer_in",
+            "83006": "transfer_in", "83007": "transfer_in", "83008": "transfer_in", "83009": "refund",
+            "83010": None, "83011": None, "83012": "yield", "83013": "transfer_in", "83014": None,
+            "83016": "yield",
+        })
+        self.assertEqual(rows["83012"]["impact_kind"], "asset_management_gain")
+        self.assertEqual(rows["83013"]["impact_kind"], "loan_disbursement")
+
+    def test_custom_credit_rules_and_whole_words(self):
+        self.cli("sync", "--daily-csv", str(BOUNDARY), "--month", "2026-10")
+        path = self.home / "rules.toml"
+        config = """
+[yield_heuristic]
+start = "23:59"
+end = "00:01"
+max_amount = "10.00"
+category = "Interés de prueba"
+
+[credit_fallback]
+enabled = false
+
+[[rule]]
+field = "description"
+word = "gas"
+kind = "purchase"
+category = "Servicios"
+direction = "debit"
+"""
+        path.write_text(config, encoding="utf-8")
+        self.cli("sync", "--daily-csv", str(BOUNDARY), "--month", "2026-09")
+        self.cli("reclassify")
+        for source, expected in {
+            "83001": ("yield", "Interés de prueba"), "83002": (None, None), "83003": (None, None),
+            "83004": (None, None), "83010": (None, None), "83011": ("purchase", "Servicios"),
+        }.items():
+            row = self.db.execute("SELECT kind,category FROM movements WHERE source=?", (source,)).fetchone()
+            self.assertEqual(tuple(row), expected)
+        path.write_text(config.replace("23:59", "25:00"), encoding="utf-8")
+        self.cli("reclassify", expected=1)
+
+    def test_import_classifications_survive_rules_and_reimport(self):
+        self.cli("sync", "--daily-csv", str(DAILY), "--month", "2026-04")
+        for _ in range(2):
+            self.assertIn("manualmente: 3", self.cli("import-classifications", str(CLASSIFICATIONS)))
+        self.assertIn("reclasificados: 0", self.cli("reclassify"))
+        self.cli("sync", "--csv", str(MONTHLY), "--daily-csv", str(DAILY), "--month", "2026-04")
+        rows = self.db.execute("SELECT source,kind,category,reviewed FROM movements WHERE reviewed ORDER BY source,id")
+        self.assertEqual([tuple(row) for row in rows], [
+            ("72001", "transfer_in", "Aportes, octubre", 1), ("72001", "transfer_in", "Aportes, octubre", 1),
+            ("72005", "purchase", "Materiales", 1),
+        ])
+
+    def test_invalid_classification_batch_rolls_back(self):
+        self.cli("sync", "--daily-csv", str(DAILY))
+        batch = self.home / "manual.csv"
+        for invalid in ("99999,purchase,Desconocido", "72004,invalido,Algo", "72004,transfer_in, ",
+                        "72005,loan,Contradice la primera fila", "72004,transfer_in", ",purchase,Algo"):
+            with self.subTest(invalid=invalid):
+                batch.write_text("source_id,kind,category\n72005,purchase,Materiales\n" + invalid,
+                                 encoding="utf-8-sig")
+                self.cli("import-classifications", str(batch), expected=1)
+                self.assertEqual(self.db.execute("SELECT count(*) FROM movements WHERE reviewed").fetchone()[0], 0)
 
     def test_legacy_ledger_migrates_without_changing_reviewed_id(self):
         home = self.home / "legacy"
@@ -151,13 +222,16 @@ category = "Inversiones"
             with self.assertRaises(ValueError):
                 reconcile(self.db, *args)
         report = monthly_report(self.db, "2026-04")
-        self.assertIn("| ARS | 38,25 | 12,00 | 26,25 |", report)
-        self.assertIn("| USD | 5,00 | 0,00 | 5,00 |", report)
+        self.assertIn("| ARS | 14,80 | 12,00 | 11,45 |", report)
+        self.assertIn("| USD | 0,00 | 0,00 | 5,00 |", report)
+        self.assertEqual(monthly_data(self.db, "2026-04")["totals"][0], {
+            "currency": "ARS", "total_cents": 3825, "account_cents": 1480, "matched_cents": 1200, "to_add_cents": 1145,
+        })
         self.assertIn("| 71 | ARS | 1 | 23,45 |", report)
         self.assertIn("Compras sin total del comprador: 1", report)
         self.assertEqual(len(review_queue(self.db)), 1)
         reconcile(self.db, "71002", "May-1", "11.45", "ARS")
-        self.assertIn("| ARS | 38,25 | 23,45 | 14,80 |", monthly_report(self.db, "2026-04"))
+        self.assertIn("| ARS | 14,80 | 23,45 | 0,00 |", monthly_report(self.db, "2026-04"))
 
     def test_offline_cli(self):
         def run(*args):
@@ -207,15 +281,15 @@ category = "Inversiones"
         args = ("report", "--month", "2026-04")
         data = json.loads(self.cli(*args, "--json"))
         self.assertEqual(data["totals"], [
-            {"currency": "ARS", "total_cents": 2345, "matched_cents": 2345, "to_add_cents": 0},
-            {"currency": "USD", "total_cents": 500, "matched_cents": 200, "to_add_cents": 300}])
+            {"currency": "ARS", "total_cents": 2345, "account_cents": 0, "matched_cents": 2345, "to_add_cents": 0},
+            {"currency": "USD", "total_cents": 500, "account_cents": 0, "matched_cents": 200, "to_add_cents": 300}])
         for key in ("cards", "issuers"):
             self.assertEqual([(r["issuer_id"], r["issuer"]) for r in data[key]],
                              [("71", "Banco de cartón"), ("72", "Banco Nube")])
         markdown = self.cli(*args)
         self.assertIn("| Banco de cartón | ARS | 1 | 23,45 |", markdown)
         self.assertIn("| 71006 | Luna | Banco Nube | USD | 5,00 | 2,00 |", markdown)
-        self.assertIn("| ARS | 23,45 | 23,45 | 0,00 |", markdown)
+        self.assertIn("| ARS | 0,00 | 23,45 | 0,00 |", markdown)
         output = self.home / "report.json"
         self.cli(*args, "--json", "--output", str(output))
         self.assertEqual(json.loads(output.read_text(encoding="utf-8")), data)

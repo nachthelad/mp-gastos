@@ -18,7 +18,7 @@ def cell(value):
 def monthly_data(db, month, issuers=None):
     month_start(month)
     issuers = {str(key): name for key, name in (issuers or {}).items()}
-    totals, matched, categories, other = Counter(), Counter(), Counter(), Counter()
+    account, cards, matched, categories, other = (Counter() for _ in range(5))
     pending = unknown = conflicts = 0
     groups = defaultdict(lambda: [0, 0])
     for row in db.execute("""
@@ -31,7 +31,7 @@ def monthly_data(db, month, issuers=None):
         if kind is None:
             pending += 1
         elif kind in ("purchase", "fee", "refund"):
-            totals[code] -= amount
+            account[code] -= amount
             categories[(code, row["category"])] -= amount
         else:
             other[(code, kind, row["category"])] += amount
@@ -55,7 +55,7 @@ def monthly_data(db, month, issuers=None):
             unknown += 1
         else:
             group[1] += paid
-            totals[code] += paid
+            cards[code] += paid
             matched[code] += linked
         issuer = row["issuer"]
         card_rows.append({"payment": row["id"], "description": row["description"], "issuer_id": issuer,
@@ -66,8 +66,9 @@ def monthly_data(db, month, issuers=None):
         "month": month,
         "settlement": {"end_at": job["end_at"], "done": bool(job["done"])} if job else None,
         "daily_only_movements": daily_gap_count(db, month),
-        "totals": [{"currency": code, "total_cents": total, "matched_cents": matched[code],
-                    "to_add_cents": total - matched[code]} for code, total in sorted(totals.items())],
+        "totals": [{"currency": code, "total_cents": account[code] + cards[code],
+                    "account_cents": account[code], "matched_cents": matched[code],
+                    "to_add_cents": cards[code] - matched[code]} for code in sorted(account.keys() | cards.keys())],
         "pending_movements": pending, "unknown_card_totals": unknown, "reconciliation_conflicts": conflicts,
         "categories": [{"currency": code, "category": category, "amount_cents": value}
                        for (code, category), value in sorted(categories.items())],
@@ -81,10 +82,12 @@ def monthly_data(db, month, issuers=None):
 
 def monthly_report(db, month, issuers=None):
     data = monthly_data(db, month, issuers)
-    lines = [f"# Gastos de {month}", "", "| Moneda | Gasto conocido | Ya en resumen | Para sumar al resumen |",
+    lines = [f"# Gastos de {month}", "",
+             "| Moneda | Compras de cuenta clasificadas (neto) | Tarjetas conciliadas | "
+             "Tarjetas sin conciliar (para sumar al resumen) |",
              "|---|---:|---:|---:|"]
     for r in data["totals"]:
-        lines.append(f"| {r['currency']} | {money(r['total_cents'])} | {money(r['matched_cents'])} | "
+        lines.append(f"| {r['currency']} | {money(r['account_cents'])} | {money(r['matched_cents'])} | "
                      f"{money(r['to_add_cents'])} |")
     job = data["settlement"]
     coverage = "Sin sincronización de reporte por API para este mes."

@@ -43,7 +43,7 @@ def ensure_config(client):
         config = {}
     if not config:
         columns = REQUIRED | {"DESCRIPTION", "TRANSACTION_AMOUNT", "FEE_AMOUNT", "EXTERNAL_REFERENCE",
-                              "PAYMENT_METHOD_TYPE"}
+                              "PAYMENT_METHOD_TYPE", "METADATA"}
         client._object("POST", REPORT + "/config", {
             "file_name_prefix": "mp-gastos", "display_timezone": "GMT-03",
             "separator": ";", "header_language": "en", "include_withdraw": True,

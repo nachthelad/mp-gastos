@@ -13,7 +13,8 @@ from urllib.parse import parse_qs, urlsplit
 
 from mp_gastos.client import REPORT, MercadoPagoClient, MercadoPagoError, access_token
 from mp_gastos.cli import main, parser
-from mp_gastos.ledger import database, initialize
+from mp_gastos.ledger import database, import_report, initialize
+from mp_gastos.settlements import load_rules
 from mp_gastos.sync import sync, windows
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -173,7 +174,7 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(self.db.execute("SELECT count(*) FROM movements").fetchone()[0], 0)
         self.assertEqual(self.db.execute("SELECT done FROM jobs").fetchone()[0], 0)
 
-    def test_api_enriches_missing_counterparties_and_caches_shared_source(self):
+    def test_api_enriches_missing_payment_details_and_caches_shared_source(self):
         path = self.home / "rules.toml"
         path.write_text("""
 [[rule]]
@@ -187,29 +188,41 @@ field = "counterparty"
 exact = "financiera ambar"
 kind = "loan"
 category = "Cuotas"
+
+[[rule]]
+field = "impact_kind"
+exact = "asset_management_gain"
+kind = "yield"
+category = "Inversiones"
 """, encoding="utf-8")
         self.server.payment_details["72005"] = {
             "description": "Reparación", "payer": {"id": 430},
             "collector": {"id": 550, "name": "Taller Nube"},
+            "impact_kind": " outgoing_payment ",
         }
         self.server.payment_details["72004"] = {
             "description": "", "collector_id": 430,
             "payer": {"id": 551, "first_name": "Luna", "last_name": "Ficticia", "email": "unused@example.test"},
+            "metadata": {"impact_kind": "asset_management_gain"},
         }
         self.server.ready = True
         data = (FIXTURES / "settlement-daily.csv").read_bytes()
         data += data.splitlines()[-1].replace(b";-10;", b";-11;") + b"\n"
         with patch.object(self.client, "download_report", return_value=data):
+            # A known counterparty in an older import must not block filling impact_kind.
+            baseline = data.replace(b";20;ARS;;;;;", b";20;ARS;;Luna Ficticia;;;")
+            import_report(self.db, baseline, load_rules(path))
             self.assertEqual(self.run_sync(), {"2026-04": "imported"})
         self.assertEqual(self.server.payment_lookups.count("72005"), 1)
         self.assertNotIn("72002", self.server.payment_lookups)
-        rows = self.db.execute("SELECT amount,description,counterparty,kind FROM movements "
+        rows = self.db.execute("SELECT amount,description,counterparty,kind,impact_kind FROM movements "
                                "WHERE source='72005' ORDER BY amount")
         self.assertEqual([tuple(row) for row in rows],
-                         [(-1100, "Reparación", "Taller Nube", "purchase"),
-                          (-1000, "Reparación", "Taller Nube", "purchase")])
-        self.assertEqual(self.db.execute("SELECT counterparty FROM movements WHERE source='72004'").fetchone()[0],
-                         "Luna Ficticia")
+                         [(-1100, "Reparación", "Taller Nube", "purchase", "outgoing_payment"),
+                          (-1000, "Reparación", "Taller Nube", "purchase", "outgoing_payment")])
+        row = self.db.execute("SELECT counterparty,impact_kind,kind,category FROM movements "
+                              "WHERE source='72004'").fetchone()
+        self.assertEqual(tuple(row), ("Luna Ficticia", "asset_management_gain", "yield", "Inversiones"))
         self.assertEqual(self.db.execute("SELECT counterparty FROM movements WHERE source='72003'").fetchone()[0], "")
         self.assertEqual(self.db.execute("SELECT kind FROM movements WHERE source='72002'").fetchone()[0], "loan")
 
