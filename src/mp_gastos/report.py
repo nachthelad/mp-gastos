@@ -3,6 +3,7 @@
 from collections import Counter, defaultdict
 from decimal import Decimal
 
+from .ledger import daily_gap_count
 from .sync import month_start
 
 
@@ -16,7 +17,7 @@ def cell(value):
 
 def monthly_data(db, month, issuers=None):
     month_start(month)
-    issuers = issuers or {}
+    issuers = {str(key): name for key, name in (issuers or {}).items()}
     totals, matched, categories, other = Counter(), Counter(), Counter(), Counter()
     pending = unknown = conflicts = 0
     groups = defaultdict(lambda: [0, 0])
@@ -64,6 +65,7 @@ def monthly_data(db, month, issuers=None):
     return {
         "month": month,
         "settlement": {"end_at": job["end_at"], "done": bool(job["done"])} if job else None,
+        "daily_only_movements": daily_gap_count(db, month),
         "totals": [{"currency": code, "total_cents": total, "matched_cents": matched[code],
                     "to_add_cents": total - matched[code]} for code, total in sorted(totals.items())],
         "pending_movements": pending, "unknown_card_totals": unknown, "reconciliation_conflicts": conflicts,
@@ -89,6 +91,8 @@ def monthly_report(db, month, issuers=None):
     if job:
         state = "importado" if job["done"] else "pendiente"
         coverage = f"Reporte de cuenta {state} hasta {job['end_at']}."
+    if data["daily_only_movements"]:
+        coverage += f" Movimientos de los diarios que faltan en el mensual: {data['daily_only_movements']}."
     lines += ["", coverage, f"Movimientos sin clasificar: {data['pending_movements']}. "
               f"Compras sin total del comprador: {data['unknown_card_totals']}.",
               f"Conciliaciones que requieren revisión: {data['reconciliation_conflicts']}.",

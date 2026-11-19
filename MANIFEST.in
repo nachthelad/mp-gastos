@@ -1,4 +1,6 @@
 include .env.example
 include tests/fixtures/settlement.csv
+include tests/fixtures/settlement-daily.csv
+include tests/fixtures/settlement-monthly.csv
 include tests/fixtures/payments.json
 include tests/fixtures/reports.json
