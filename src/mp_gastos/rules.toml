@@ -12,6 +12,7 @@ category = "Rendimientos"
 # Se aplica al final, después del rendimiento y de las reglas.
 [credit_fallback]
 enabled = true
+# Opcional. Borrá esta línea o usá "" para dejar la categoría vacía.
 category = "Transferencias recibidas"
 
 # Rules are evaluated in order. Categories can be freely renamed.
