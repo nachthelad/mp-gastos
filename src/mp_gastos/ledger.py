@@ -2,9 +2,16 @@
 
 import csv
 import sqlite3
+from collections import Counter
 from contextlib import contextmanager
 
-from .settlements import DEFAULT_RULES, KINDS, cents, currency, parse_report
+from .settlements import (DEFAULT_RULES, DETAIL_FIELDS, KINDS, cents, classify, currency, local_date, month_end,
+                          movement_identity, parse_report)
+
+MONTHLY, DAILY = 1, 2
+MONTHLY_REPORTS = """
+CREATE TABLE IF NOT EXISTS monthly_reports (month TEXT PRIMARY KEY, end_at TEXT NOT NULL);
+"""
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS account (slot INTEGER PRIMARY KEY CHECK(slot=1), payer TEXT NOT NULL);
@@ -14,7 +21,10 @@ CREATE TABLE IF NOT EXISTS jobs (
 CREATE TABLE IF NOT EXISTS movements (
     id INTEGER PRIMARY KEY, identity TEXT UNIQUE NOT NULL, source TEXT NOT NULL, date TEXT NOT NULL,
     event TEXT NOT NULL, amount INTEGER NOT NULL, currency TEXT NOT NULL, description TEXT NOT NULL,
-    kind TEXT, category TEXT, reviewed INTEGER NOT NULL DEFAULT 0
+    kind TEXT, category TEXT, reviewed INTEGER NOT NULL DEFAULT 0,
+    external_reference TEXT NOT NULL DEFAULT '', payment_method_type TEXT NOT NULL DEFAULT '',
+    counterparty TEXT NOT NULL DEFAULT '', impact_kind TEXT NOT NULL DEFAULT '',
+    report_origin INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS movement_source ON movements(source);
 CREATE TABLE IF NOT EXISTS cards (
@@ -25,7 +35,7 @@ CREATE TABLE IF NOT EXISTS statement_lines (
     reference TEXT PRIMARY KEY, payment TEXT NOT NULL REFERENCES cards(id),
     amount INTEGER NOT NULL CHECK(amount > 0), currency TEXT NOT NULL
 );
-"""
+""" + MONTHLY_REPORTS
 
 
 def initialize(home):
@@ -49,25 +59,117 @@ def database(home, *, create=False):
     db.execute("PRAGMA foreign_keys=ON")
     try:
         with db:
+            _upgrade_movements(db)
             yield db
     finally:
         db.close()
+
+
+def _upgrade_movements(db):
+    columns = {row["name"] for row in db.execute("PRAGMA table_info(movements)")}
+    if not columns or "report_origin" in columns:
+        return
+    with db:
+        db.execute("BEGIN IMMEDIATE")
+        if any(row["name"] == "report_origin" for row in db.execute("PRAGMA table_info(movements)")):
+            return
+        for field in DETAIL_FIELDS[1:]:
+            db.execute(f"ALTER TABLE movements ADD COLUMN {field} TEXT NOT NULL DEFAULT ''")
+        db.execute("ALTER TABLE movements ADD COLUMN report_origin INTEGER NOT NULL DEFAULT 0")
+        db.execute(MONTHLY_REPORTS)
+        occurrences = Counter()
+        db.execute("UPDATE movements SET identity='legacy:' || id")
+        db.executemany("UPDATE movements SET identity=? WHERE id=?", (
+            (movement_identity(row, occurrences), row["id"]) for row in db.execute(
+                "SELECT id,source,date,event,amount,currency FROM movements ORDER BY id")
+        ))
 
 
 def import_report(db, payload, rules):
     import_reports(db, (payload,), rules)
 
 
-def import_reports(db, payloads, rules):
+def import_reports(db, payloads, rules, *, daily=(), monthly_end=None, enrich=None):
+    if monthly_end is None:
+        coverage = {}
+    else:
+        end = local_date(monthly_end)
+        coverage = {end.strftime("%Y-%m"): end.isoformat()}
+    months = set(coverage)
+    movements = {}
+    for reports, origin in ((daily, DAILY), (payloads, MONTHLY)):
+        for payload in reports:
+            for row in parse_report(payload):
+                month = row["date"][:7]
+                months.add(month)
+                if origin == MONTHLY and monthly_end is None and month not in coverage:
+                    coverage[month] = month_end(local_date(row["date"])).isoformat()
+                identity = row["identity"]
+                if identity in movements:
+                    prior = movements[identity]
+                    for field in DETAIL_FIELDS:
+                        row[field] = row[field] or prior[field]
+                    origin_flags = prior["report_origin"] | origin
+                else:
+                    origin_flags = origin
+                row["report_origin"] = origin_flags
+                movements[identity] = row
+
+    if enrich:
+        for row in movements.values():
+            if not row["counterparty"]:
+                stored = db.execute("SELECT counterparty FROM movements WHERE identity=?",
+                                    (row["identity"],)).fetchone()
+                if not stored or not stored["counterparty"]:
+                    for field, value in enrich(row["source"]).items():
+                        row[field] = row[field] or value
+
     with db:
+        db.execute("BEGIN IMMEDIATE")
         db.executemany("""
-            INSERT INTO movements(identity,source,date,event,amount,currency,description,kind,category)
-            VALUES (?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(identity) DO UPDATE SET description=excluded.description,
-                amount=excluded.amount, currency=excluded.currency,
-                kind=CASE WHEN reviewed THEN kind ELSE excluded.kind END,
-                category=CASE WHEN reviewed THEN category ELSE excluded.category END
-        """, (row for payload in payloads for row in parse_report(payload, rules)))
+            INSERT INTO monthly_reports(month,end_at) VALUES (?,?)
+            ON CONFLICT(month) DO UPDATE SET end_at=excluded.end_at
+            WHERE julianday(excluded.end_at) > julianday(monthly_reports.end_at)
+        """, coverage.items())
+        for row in movements.values():
+            existing = db.execute("SELECT * FROM movements WHERE identity=?", (row["identity"],)).fetchone()
+            if existing:
+                for field in DETAIL_FIELDS:
+                    row[field] = row[field] or existing[field]
+                row["report_origin"] |= existing["report_origin"]
+            row["kind"], row["category"] = classify(row, rules)
+            db.execute("""
+                INSERT INTO movements(identity,source,date,event,amount,currency,description,external_reference,
+                                      payment_method_type,counterparty,impact_kind,report_origin,kind,category)
+                VALUES (:identity,:source,:date,:event,:amount,:currency,:description,:external_reference,
+                        :payment_method_type,:counterparty,:impact_kind,:report_origin,:kind,:category)
+                ON CONFLICT(identity) DO UPDATE SET description=excluded.description,
+                    external_reference=excluded.external_reference, payment_method_type=excluded.payment_method_type,
+                    counterparty=excluded.counterparty, impact_kind=excluded.impact_kind,
+                    report_origin=excluded.report_origin,
+                    kind=CASE WHEN reviewed THEN kind ELSE excluded.kind END,
+                    category=CASE WHEN reviewed THEN category ELSE excluded.category END
+            """, row)
+    return months
+
+
+def daily_gap_count(db, month):
+    return db.execute("""
+        SELECT count(*) FROM movements m JOIN monthly_reports r ON r.month=substr(m.date,1,7)
+        WHERE r.month=? AND m.report_origin=? AND julianday(m.date) <= julianday(r.end_at)
+    """, (month, DAILY)).fetchone()[0]
+
+
+def reclassify(db, rules):
+    with db:
+        db.execute("BEGIN IMMEDIATE")
+        updates = []
+        for row in db.execute("SELECT * FROM movements WHERE NOT reviewed"):
+            kind, category = classify(row, rules)
+            if (kind, category) != (row["kind"], row["category"]):
+                updates.append((kind, category, row["id"]))
+        db.executemany("UPDATE movements SET kind=?, category=? WHERE id=?", updates)
+    return len(updates)
 
 
 def review_queue(db):

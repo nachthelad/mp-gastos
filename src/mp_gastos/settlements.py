@@ -1,5 +1,6 @@
 """Settlement rows, exact money and user-editable classification rules."""
 
+import calendar
 import csv
 import hashlib
 import io
@@ -13,11 +14,16 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 ARGENTINA = timezone(timedelta(hours=-3))
-KINDS = ("purchase", "transfer", "card_payment", "yield", "fee", "refund", "withdrawal", "other")
+KINDS = ("purchase", "transfer", "card_payment", "yield", "fee", "refund", "withdrawal", "loan", "other")
 REQUIRED = {"SOURCE_ID", "TRANSACTION_DATE", "TRANSACTION_TYPE", "SETTLEMENT_NET_AMOUNT",
             "TRANSACTION_CURRENCY"}
-FIELDS = {"description", "transaction_type", "external_reference", "payment_method_type"}
+DETAIL_FIELDS = ("description", "external_reference", "payment_method_type", "counterparty", "impact_kind")
+FIELDS = {"transaction_type", *DETAIL_FIELDS}
+OPERATORS = {"contains", "exact", "prefix"}
 DEFAULT_RULES = Path(__file__).with_name("rules.toml")
+YIELD_MARKER = re.compile(
+    r"\b(rendimientos?|yield|investment interest|money market|asset management gain)\b"
+)
 
 
 def cents(value):
@@ -49,6 +55,11 @@ def normalize(value):
                    if not unicodedata.combining(c)).strip()
 
 
+def month_end(start):
+    return start.replace(day=calendar.monthrange(start.year, start.month)[1],
+                         hour=23, minute=59, second=59, microsecond=999000)
+
+
 def _load_config(path):
     with path.open("rb") as stream:
         config = tomllib.load(stream)
@@ -63,7 +74,8 @@ def load_issuers(path):
         isinstance(name, str) and name.strip() for name in issuers.values()
     ):
         raise ValueError("Expected issuer names in the [issuers] table.")
-    return issuers
+    # TOML parses bare numeric keys and quoted keys as strings.
+    return {str(key): name for key, name in issuers.items()}
 
 
 def load_rules(path):
@@ -71,25 +83,49 @@ def load_rules(path):
     if not isinstance(rules, list):
         raise ValueError("Expected a list of [[rule]] sections.")
     for rule in rules:
-        if (not isinstance(rule, dict) or rule.keys() - {"field", "contains", "kind", "category", "direction"}
+        if (not isinstance(rule, dict) or rule.keys() - (OPERATORS | {"field", "kind", "category", "direction"})
                 or rule.get("field") not in FIELDS or rule.get("kind") not in KINDS
                 or rule.get("direction", "any") not in ("debit", "credit", "any")
-                or not all(isinstance(rule.get(k), str) and rule[k].strip()
-                           for k in ("contains", "category"))):
+                or len(OPERATORS & rule.keys()) != 1
+                or not all(isinstance(rule.get(k), str) and normalize(rule[k])
+                           for k in {"category"} | (OPERATORS & rule.keys()))):
             raise ValueError("Invalid classification rule.")
     return rules
 
 
-def classify(row, amount, rules):
+def classify(row, rules):
+    amount = row["amount"]
     direction = "debit" if amount < 0 else "credit" if amount > 0 else "neutral"
     for rule in rules:
-        if (rule.get("direction", "any") in ("any", direction)
-                and normalize(rule["contains"]) in normalize(row.get(rule["field"].upper(), ""))):
+        if rule.get("direction", "any") not in ("any", direction):
+            continue
+        field = rule["field"]
+        value = row["event"] if field == "transaction_type" else row[field]
+        if field == "description" and not value:
+            value = row["counterparty"]
+        value = normalize(value)
+        if (("contains" in rule and normalize(rule["contains"]) in value)
+                or ("exact" in rule and normalize(rule["exact"]) == value)
+                or ("prefix" in rule and value.startswith(normalize(rule["prefix"])))):
             return rule["kind"], rule["category"]
+    if amount < 0 and normalize(row["external_reference"]).startswith(("ccpaymentprod_", "cctiprod-")):
+        return "card_payment", "Tarjeta"
+    if amount > 0 and row["event"] == "SETTLEMENT":
+        for field in ("description", "counterparty", "external_reference", "impact_kind", "payment_method_type"):
+            if YIELD_MARKER.search(normalize(row[field]).replace("_", " ").replace("-", " ")):
+                return "yield", "Rendimientos"
     return None, None
 
 
-def parse_report(payload, rules):
+def movement_identity(row, occurrences):
+    # Financial fields match the same movement across reports with different metadata.
+    key = [row[field] for field in ("source", "event", "date", "currency", "amount")]
+    digest = hashlib.sha256(json.dumps(key).encode()).hexdigest()
+    occurrences[digest] += 1
+    return f"{digest}.{occurrences[digest]}"
+
+
+def parse_report(payload):
     try:
         text = payload.decode("utf-8-sig")
     except UnicodeDecodeError:
@@ -135,14 +171,7 @@ def parse_report(payload, rules):
         event = row["TRANSACTION_TYPE"].upper()
         if not event:
             raise ValueError("Missing settlement event type.")
-        # A purchase and its later refund may share SOURCE_ID. Preserve repeated
-        # equal rows within one export while deduplicating overlapping exports.
-        identity = [source, event, date]
-        if not source:
-            identity.extend((code, amount))
-            identity.extend(row.get(k, "") for k in ("DESCRIPTION", "EXTERNAL_REFERENCE", "COUNTERPARTY"))
-        digest = hashlib.sha256(json.dumps(identity).encode()).hexdigest()
-        occurrences[digest] += 1
-        kind, category = classify(row, amount, rules)
-        yield (f"{digest}.{occurrences[digest]}", source, date, event, amount, code,
-               row.get("DESCRIPTION", ""), kind, category)
+        movement = dict(source=source, date=date, event=event, amount=amount, currency=code)
+        movement.update({field: row.get(field.upper(), "") for field in DETAIL_FIELDS})
+        movement["identity"] = movement_identity(movement, occurrences)
+        yield movement

@@ -1,10 +1,17 @@
 [issuers]
-# "71" = "Banco de ejemplo"
+# 71 = "Banco de ejemplo"
 
 # Rules are evaluated in order. Categories can be freely renamed.
 [[rule]]
 field = "external_reference"
-contains = "ccpaymentprod_"
+prefix = "ccpaymentprod_"
+kind = "card_payment"
+category = "Tarjeta"
+direction = "debit"
+
+[[rule]]
+field = "external_reference"
+prefix = "cctiprod-"
 kind = "card_payment"
 category = "Tarjeta"
 direction = "debit"

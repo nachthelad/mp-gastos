@@ -1,17 +1,21 @@
 import csv
 import io
 import json
+import sqlite3
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from mp_gastos.cli import main
-from mp_gastos.ledger import classify_movement, database, import_report, initialize, reconcile, review_queue
+from mp_gastos.ledger import (classify_movement, daily_gap_count, database, import_report, import_reports,
+                             initialize, reconcile, review_queue)
 from mp_gastos.report import monthly_report
 from mp_gastos.settlements import load_rules
 
 FIXTURE = Path(__file__).parent / "fixtures" / "settlement.csv"
+DAILY = FIXTURE.with_name("settlement-daily.csv")
+MONTHLY = FIXTURE.with_name("settlement-monthly.csv")
 
 
 class LedgerTests(unittest.TestCase):
@@ -31,7 +35,87 @@ class LedgerTests(unittest.TestCase):
         import_report(self.db, self.csv, [])
         self.assertEqual(self.db.execute("SELECT category FROM movements WHERE reviewed").fetchone()[0],
                          "Models")
-        self.assertEqual(len(review_queue(self.db)), 5)
+        self.assertEqual(len(review_queue(self.db)), 4)
+
+    def test_daily_monthly_overlap_and_reclassification(self):
+        self.cli("sync", "--daily-csv", str(DAILY))
+        self.assertEqual(daily_gap_count(self.db, "2026-04"), 0)
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(main(["--home", str(self.home), "sync", "--csv", str(MONTHLY),
+                                   "--daily-csv", str(DAILY), "--daily-csv", str(DAILY)]), 0)
+        self.assertIn("2026-04: 1 movimiento(s)", err.getvalue())
+        self.assertEqual(self.db.execute("SELECT count(*) FROM movements").fetchone()[0], 6)
+        yields = self.db.execute("SELECT amount,kind FROM movements WHERE source='72001' ORDER BY amount")
+        self.assertEqual([tuple(row) for row in yields], [(27, "yield"), (111, "yield")])
+        rules = self.home / "rules.toml"
+        rules.write_text("""
+[[rule]]
+field = "counterparty"
+exact = "financiera ambar"
+kind = "loan"
+category = "Cuotas"
+direction = "debit"
+
+[[rule]]
+field = "impact_kind"
+prefix = "asset_management"
+kind = "yield"
+category = "Inversiones"
+""", encoding="utf-8")
+        movement = self.db.execute("SELECT id FROM movements WHERE source='72005'").fetchone()[0]
+        classify_movement(self.db, movement, "purchase", "Manual")
+        self.assertIn("reclasificados: 3", self.cli("reclassify"))
+        self.assertIn("reclasificados: 0", self.cli("reclassify"))
+        for source, kind, category in (("72002", "loan", "Cuotas"), ("72003", "card_payment", "Tarjeta"),
+                                       ("72004", None, None), ("72005", "purchase", "Manual")):
+            values = self.db.execute("SELECT kind,category FROM movements WHERE source=?", (source,)).fetchone()
+            self.assertEqual(tuple(values), (kind, category))
+        data = json.loads(self.cli("report", "--month", "2026-04", "--json"))
+        self.assertEqual(data["daily_only_movements"], 1)
+        self.assertIn({"currency": "ARS", "kind": "loan", "category": "Cuotas", "net_cents": -2000},
+                      data["other_movements"])
+
+    def test_daily_after_partial_month_and_month_updates(self):
+        daily = DAILY.read_bytes()
+        empty = MONTHLY.read_bytes().splitlines()[0]
+        import_reports(self.db, [empty], self.rules, monthly_end="2026-04-18T07:00:00-03:00")
+        import_reports(self.db, [], self.rules, daily=[daily])
+        self.assertEqual(daily_gap_count(self.db, "2026-04"), 0)
+        import_report(self.db, MONTHLY.read_bytes(), self.rules)
+        self.assertEqual(daily_gap_count(self.db, "2026-04"), 1)
+        import_report(self.db, daily, self.rules)
+        self.assertEqual(daily_gap_count(self.db, "2026-04"), 0)
+        self.assertEqual(self.db.execute("SELECT count(*) FROM movements").fetchone()[0], 6)
+
+    def test_empty_monthly_csv_with_explicit_month(self):
+        empty = self.home / "empty.csv"
+        empty.write_bytes(MONTHLY.read_bytes().splitlines()[0])
+        self.cli("sync", "--csv", str(empty), "--month", "2026-04", "--daily-csv", str(DAILY))
+        self.assertEqual(daily_gap_count(self.db, "2026-04"), 6)
+
+    def test_invalid_daily_batch_rolls_back(self):
+        with self.assertRaises(ValueError):
+            import_reports(self.db, [MONTHLY.read_bytes()], self.rules, daily=[DAILY.read_bytes(), b"bad"])
+        self.assertEqual(self.db.execute("SELECT count(*) FROM movements").fetchone()[0], 0)
+        self.assertEqual(self.db.execute("SELECT count(*) FROM monthly_reports").fetchone()[0], 0)
+
+    def test_legacy_ledger_migrates_without_changing_reviewed_id(self):
+        home = self.home / "legacy"
+        home.mkdir()
+        stamp = "2026-04-18T08:00:00-03:00"
+        with sqlite3.connect(home / "ledger.sqlite3") as old:
+            old.execute("""CREATE TABLE movements (
+                id INTEGER PRIMARY KEY, identity TEXT UNIQUE NOT NULL, source TEXT NOT NULL,
+                date TEXT NOT NULL, event TEXT NOT NULL, amount INTEGER NOT NULL, currency TEXT NOT NULL,
+                description TEXT NOT NULL, kind TEXT, category TEXT, reviewed INTEGER NOT NULL DEFAULT 0
+            )""")
+            old.execute("INSERT INTO movements VALUES(88,'old.1','72001',?,'SETTLEMENT',27,'ARS','','yield','Manual',1)",
+                        (stamp,))
+        old.close()
+        with database(home) as upgraded:
+            import_reports(upgraded, [MONTHLY.read_bytes()], self.rules, daily=[DAILY.read_bytes()])
+            rows = upgraded.execute("SELECT id,amount,category FROM movements WHERE source='72001' ORDER BY amount")
+            self.assertEqual([tuple(row) for row in rows], [(88, 27, "Manual"), (89, 111, "Rendimientos")])
 
     def test_multiline_quotes_refund_and_anonymous_duplicates(self):
         header = self.csv.splitlines()[0]
@@ -111,7 +195,8 @@ class LedgerTests(unittest.TestCase):
             self.db.executemany("INSERT INTO cards VALUES(?,?,?,?,?,?,?,1)", [
                 ("71002", "2026-04-10", "71", "ARS", 2345, "Cometas", "credit_card"),
                 ("71006", "2026-04-12", "72", "USD", 500, "Luna", "credit_card")])
-        (self.home / "rules.toml").write_text('[issuers]\n"71" = "Banco de cartón"\n', encoding="utf-8")
+        (self.home / "rules.toml").write_text('[issuers]\n71 = "Banco de cartón"\n"72" = "Banco Nube"\n',
+                                             encoding="utf-8")
         self.cli("sync", "--csv", str(FIXTURE))
         batch = self.home / "lines.csv"
         batch.write_text('payment,line\n71002,"Resumen, línea 3"\n', encoding="utf-8-sig")
@@ -126,10 +211,10 @@ class LedgerTests(unittest.TestCase):
             {"currency": "USD", "total_cents": 500, "matched_cents": 200, "to_add_cents": 300}])
         for key in ("cards", "issuers"):
             self.assertEqual([(r["issuer_id"], r["issuer"]) for r in data[key]],
-                             [("71", "Banco de cartón"), ("72", "72")])
+                             [("71", "Banco de cartón"), ("72", "Banco Nube")])
         markdown = self.cli(*args)
         self.assertIn("| Banco de cartón | ARS | 1 | 23,45 |", markdown)
-        self.assertIn("| 71006 | Luna | 72 | USD | 5,00 | 2,00 |", markdown)
+        self.assertIn("| 71006 | Luna | Banco Nube | USD | 5,00 | 2,00 |", markdown)
         self.assertIn("| ARS | 23,45 | 23,45 | 0,00 |", markdown)
         output = self.home / "report.json"
         self.cli(*args, "--json", "--output", str(output))

@@ -1,13 +1,12 @@
 """Sync one account in bounded calendar-month windows."""
 
-import calendar
 import re
 import time
 from datetime import UTC, datetime, timedelta
 
 from .client import CARD_TYPES, REPORT, MercadoPagoError, ready_files, report_task_id
 from .ledger import import_reports
-from .settlements import ARGENTINA, REQUIRED, cents, currency, load_rules, local_date
+from .settlements import ARGENTINA, REQUIRED, cents, currency, load_rules, local_date, month_end
 
 DEFAULT_WAIT = 180
 
@@ -26,8 +25,7 @@ def windows(month, months, now):
         raise ValueError("Choose up to 12 months within the current and preceding 11 calendar months.")
     result = []
     for _ in range(months):
-        following = start + timedelta(days=calendar.monthrange(start.year, start.month)[1])
-        result.append((start, min(today, following - timedelta(milliseconds=1))))
+        result.append((start, min(today, month_end(start))))
         start = (start - timedelta(days=1)).replace(day=1)
     return reversed(result)
 
@@ -106,7 +104,7 @@ def _matches_window(report, begin, end):
         return False
 
 
-def _sync_settlement(db, client, start, end, rules, wait):
+def _sync_settlement(db, client, start, end, rules, wait, enrich):
     month = start.strftime("%Y-%m")
     begin, cutoff = api_date(start), api_date(end)
     reports = client.list_reports()
@@ -146,7 +144,8 @@ def _sync_settlement(db, client, start, end, rules, wait):
         state = str((ready or {}).get("status")).lower()
         files = ready_files(ready or {})
         if files:
-            import_reports(db, (client.download_report(name) for name in files), rules)
+            import_reports(db, (client.download_report(name) for name in files), rules,
+                           monthly_end=cutoff, enrich=enrich)
             with db:
                 db.execute("UPDATE jobs SET done=1 WHERE month=? AND end_at=? AND task=?",
                            (month, cutoff, task))
@@ -173,11 +172,12 @@ def sync(db, client, month, *, months=1, rules_path, wait=DEFAULT_WAIT, now=None
         if db.execute("SELECT payer FROM account").fetchone()[0] != payer:
             raise ValueError("This ledger belongs to another account. Choose another data directory.")
     ensure_config(client)
+    enrich = client.payment_enricher(payer)
     result = {}
     for start, end in periods:
         sync_cards(db, client, payer, start, end)
-        status = _sync_settlement(db, client, start, end, rules, wait)
+        status = _sync_settlement(db, client, start, end, rules, wait, enrich)
         if status == "catch_up":
-            status = _sync_settlement(db, client, start, end, rules, wait)
+            status = _sync_settlement(db, client, start, end, rules, wait, enrich)
         result[start.strftime("%Y-%m")] = status
     return result

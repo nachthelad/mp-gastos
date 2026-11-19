@@ -49,23 +49,59 @@ La sincronización consulta la configuración del reporte y solicita el período
 
 El sync espera hasta **180 segundos** por reporte. Si sigue pendiente, devuelve código **2** y guarda la tarea. Volvé a correrlo con el mismo mes para retomar la descarga. Con `--wait 0` consulta una vez y devuelve el control. El código **0** indica éxito y **1** indica un error operativo. Las compras con tarjeta se actualizan incluso si el reporte queda pendiente.
 
+### Combiná el mensual con reportes diarios
+
+Descargá los CSV diarios de **Todas las transacciones** y pasá un `--daily-csv` por archivo. Podés importar los diarios solos, antes o después del mensual descargado por `sync`, o cargar todo junto.
+
+```console
+mp-gastos sync --daily-csv tests/fixtures/settlement-daily.csv
+mp-gastos sync --csv tests/fixtures/settlement-monthly.csv --daily-csv tests/fixtures/settlement-daily.csv
+```
+
+La base deduplica por `SOURCE_ID`, tipo de operación, fecha y hora, moneda e importe neto. Conserva importes distintos para un mismo ID y respeta la cantidad de veces que una fila idéntica aparece en un mismo CSV. También conserva los campos que aporta un archivo cuando vienen vacíos en el otro. Si una fila aparece únicamente en los diarios dentro del período cubierto por un mensual importado, `sync` muestra un aviso en stderr y el informe mensual muestra el recuento. En JSON se llama `daily_only_movements`. Si el mensual está vacío, pasá `--month AAAA-MM` junto con `--csv` para registrar qué mes cubre.
+
+Si el archivo incluye `COUNTERPARTY`, se usa como contraparte y sirve como descripción para las reglas cuando `DESCRIPTION` viene vacía. El sync por API busca los IDs numéricos sin contraparte en la API de pagos. Usa el nombre que devuelva MP cuando está disponible y puede aprovechar la descripción o el ID de la otra parte. Para habilitar esa consulta al cargar archivos locales, pasá `--enrich` con el token de la misma cuenta. Las filas cuyo detalle MP no encuentra o no permite consultar se importan con los datos disponibles. [API de consulta de pagos](https://www.mercadopago.com.ar/developers/es/reference/online-payments/subscriptions/get-payment/get)
+
+### Ajustá y reaplicá las reglas
+
 En la salida JSON de `report` y `review`, los campos que terminan en `_cents` expresan centavos enteros. En `report`, cada moneda tiene su propio `to_add_cents`, que corresponde a **Para sumar al resumen**. Cuando falta el total del comprador, `paid_cents` vale `null`.
 
-Cada regla de `.mp-gastos/rules.toml` define un campo, un texto a buscar, un tipo y una categoría libre. Podés restringirla a débitos o créditos. Se aplica la primera coincidencia, ignorando mayúsculas y acentos. Los movimientos ambiguos quedan en `review`. Al reimportar el reporte se vuelven a evaluar las reglas y se respetan tus decisiones manuales. Estos son los tipos disponibles.
+En `.mp-gastos/rules.toml`, elegí un campo entre `description`, `counterparty`, `transaction_type`, `external_reference`, `payment_method_type` e `impact_kind`. Este último toma el valor de `IMPACT_KIND` cuando el CSV trae esa columna. Cada regla usa un operador. `contains` busca el texto en cualquier posición, `exact` compara el valor completo y `prefix` compara el comienzo. Se aplica la primera coincidencia, ignorando mayúsculas y acentos. Podés restringir la regla a `debit` o `credit` y elegir la categoría.
+
+```toml
+[[rule]]
+field = "counterparty"
+exact = "Financiera Ámbar"
+kind = "loan"
+category = "Cuotas de préstamo"
+direction = "debit"
+
+[[rule]]
+field = "impact_kind"
+prefix = "asset_management"
+kind = "yield"
+category = "Inversiones"
+direction = "credit"
+```
+
+Si ninguna regla coincide, un débito con referencia que empieza con `ccpaymentprod_` o `cctiprod-` se clasifica como pago de tarjeta. Un crédito `SETTLEMENT` se clasifica como rendimiento cuando sus datos lo identifican como tal, por ejemplo con `Rendimiento` o `asset_management_gain`. Los movimientos ambiguos quedan en `review`. Estos son los tipos disponibles.
 
 ```text
-purchase  transfer  card_payment  yield  fee  refund  withdrawal  other
+purchase  transfer  card_payment  yield  fee  refund  withdrawal  loan  other
 ```
+
+Después de editar las reglas, ejecutá `mp-gastos reclassify`. El comando usa los datos guardados y respeta las clasificaciones manuales. La base se actualiza automáticamente al abrirla. Para recuperar columnas que la versión anterior descartaba o filas que se habían confundido al importar, cargá de nuevo los CSV originales.
 
 ## Conciliá con el resumen de tu tarjeta
 
-El informe lista los ID de pago y agrupa las compras por emisor y moneda. Toma el importe total pagado por el comprador, incluidos los cargos informados por MP. Cuando MP omite ese total, la compra aparece como pendiente de importe. Las transferencias, los rendimientos y el pago de la tarjeta quedan fuera del gasto de consumo.
+El informe lista los ID de pago y agrupa las compras por emisor y moneda. Toma el importe total pagado por el comprador, incluidos los cargos informados por MP. Cuando MP omite ese total, la compra aparece como pendiente de importe. Las transferencias, los rendimientos, los préstamos y el pago de la tarjeta quedan fuera del gasto de consumo.
 
-Para mostrar el nombre del emisor, cargá sus códigos en la tabla `[issuers]` de `.mp-gastos/rules.toml`. Si ya tenías un archivo de reglas, podés agregarle esta tabla. Los emisores sin nombre configurado se muestran con su código.
+Para mostrar el nombre del emisor, cargá sus códigos en la tabla `[issuers]` de `.mp-gastos/rules.toml`. Podés escribir los códigos numéricos con o sin comillas. Los emisores sin nombre configurado se muestran con su código.
 
 ```toml
 [issuers]
-"71" = "Banco de ejemplo"
+71 = "Banco de ejemplo"
+"72" = "Otro banco de ejemplo"
 ```
 
 Buscá el consumo en el resumen del emisor. Una vez identificado, ingresá el ID de pago de MP, una referencia única para esa línea, el importe del resumen y su moneda. Por ejemplo, para la primera cuota de una compra ficticia de ARS 23,45:

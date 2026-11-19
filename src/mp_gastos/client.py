@@ -4,6 +4,7 @@ import json
 import os
 import time
 from decimal import Decimal
+from functools import cache
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
@@ -89,6 +90,41 @@ class MercadoPagoClient:
             raise MercadoPagoError("Missing payer ID.")
         return payer
 
+    def get_payment(self, source_id):
+        return self._object("GET", "/v1/payments/" + quote(source_id, safe=""))
+
+    def payment_enricher(self, account):
+        @cache
+        def enrich(source):
+            if not source.isascii() or not source.isdecimal():
+                return {}
+            try:
+                payment = self.get_payment(source)
+            except MercadoPagoError as exc:
+                # A settlement source can identify another kind of operation or
+                # a payment whose details this account cannot query.
+                if exc.status in (400, 403, 404):
+                    return {}
+                raise
+            description = _label(payment.get("description"))
+            counterparty = _label(payment.get("counterparty"))
+            payer, collector = payment.get("payer"), payment.get("collector")
+            payer = payer if isinstance(payer, dict) else {}
+            collector = collector if isinstance(collector, dict) else {}
+            collector_id = payment.get("collector_id") or collector.get("id")
+            payer_id = payer.get("id") or payment.get("payer_id")
+            other, other_id = {}, None
+            if str(collector_id) == account:
+                other, other_id = payer, payer_id
+            elif str(payer_id) == account:
+                other, other_id = collector, collector_id
+            name = (_label(other.get("name")) or
+                    " ".join(filter(None, (_label(other.get("first_name")), _label(other.get("last_name"))))))
+            return {"description": description,
+                    "counterparty": counterparty or name or description or str(other_id or "")}
+
+        return enrich
+
     def search_card_payments(self, payer_id, payment_type, begin_date, end_date):
         if payment_type not in CARD_TYPES:
             raise ValueError("Unsupported card type.")
@@ -153,3 +189,7 @@ class MercadoPagoClient:
         if "/" in filename or "\\" in filename:
             raise MercadoPagoError("Invalid report filename.")
         return self._request("GET", REPORT + "/" + quote(filename, safe=""))
+
+
+def _label(value):
+    return value.strip() if isinstance(value, str) else ""

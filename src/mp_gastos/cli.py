@@ -9,11 +9,11 @@ from datetime import datetime
 from pathlib import Path
 
 from .client import MercadoPagoClient, MercadoPagoError
-from .ledger import (classify_movement, database, import_reconciliations, import_report, initialize,
-                     reconcile, review_queue)
+from .ledger import (classify_movement, daily_gap_count, database, import_reconciliations, import_reports,
+                     initialize, reclassify, reconcile, review_queue)
 from .report import money, monthly_data, monthly_report
-from .settlements import ARGENTINA, KINDS, load_issuers, load_rules
-from .sync import DEFAULT_WAIT, sync
+from .settlements import ARGENTINA, KINDS, load_issuers, load_rules, month_end
+from .sync import DEFAULT_WAIT, month_start, sync
 
 
 def parser():
@@ -26,7 +26,11 @@ def parser():
     update.add_argument("--months", type=int, default=1)
     update.add_argument("--wait", type=int, default=DEFAULT_WAIT,
                         help="Seconds to wait for each report (default: %(default)s)")
-    update.add_argument("--csv", type=Path, help="Import this settlement offline")
+    update.add_argument("--csv", type=Path, help="Import a monthly settlement CSV")
+    update.add_argument("--daily-csv", type=Path, action="append", default=[],
+                        help="Import a daily settlement CSV (repeat for multiple files)")
+    update.add_argument("--enrich", action="store_true", help="Look up missing counterparties for local CSVs")
+    cmds.add_parser("reclassify", help="Reapply rules to movements without a manual classification")
     review = cmds.add_parser("review", help="List pending movements or classify one")
     review.add_argument("--id", type=int)
     review.add_argument("--kind", choices=KINDS)
@@ -56,30 +60,56 @@ def main(argv=None):
         with database(args.home) as db:
             if args.command == "sync":
                 rules = args.home / "rules.toml"
-                if args.csv:
-                    if args.month or args.months != 1:
-                        raise ValueError("Use --month and --months only with API sync.")
-                    import_report(db, args.csv.read_bytes(), load_rules(rules))
+                status_code = 0
+                if args.csv or args.daily_csv:
+                    if args.months != 1 or (args.month and not args.csv):
+                        raise ValueError("Use --months with API sync and --month with API sync or a monthly CSV.")
+                    end = month_end(month_start(args.month)).isoformat() if args.month else None
+                    enrich = None
+                    if args.enrich:
+                        client = MercadoPagoClient()
+                        payer = client.get_user_id()
+                        stored = db.execute("SELECT payer FROM account").fetchone()
+                        if stored and stored["payer"] != payer:
+                            raise ValueError("This ledger belongs to another account.")
+                        enrich = client.payment_enricher(payer)
+                    periods = import_reports(db, (args.csv.read_bytes(),) if args.csv else (), load_rules(rules),
+                                             daily=(path.read_bytes() for path in args.daily_csv),
+                                             monthly_end=end, enrich=enrich)
                     print("Settlement imported.")
                 else:
+                    if args.enrich:
+                        raise ValueError("API sync already enriches payments. Use --enrich with local CSVs.")
                     month = args.month or datetime.now(ARGENTINA).strftime("%Y-%m")
                     results = sync(db, MercadoPagoClient(), month, months=args.months,
                                    rules_path=rules, wait=args.wait)
                     for period, status in results.items():
                         print(f"{period}: settlement {status}, cards synced")
+                    periods = results
                     if "pending" in results.values():
-                        return 2
+                        status_code = 2
+                for period in sorted(periods):
+                    count = daily_gap_count(db, period)
+                    if count:
+                        print(f"Aviso {period}: {count} movimiento(s) en los reportes diarios "
+                              "que faltan en el mensual.", file=sys.stderr)
+                return status_code
+            elif args.command == "reclassify":
+                count = reclassify(db, load_rules(args.home / "rules.toml"))
+                print(f"Movimientos reclasificados: {count}.")
             elif args.command == "review":
                 if args.id is None and args.kind is None and args.category is None:
                     rows = review_queue(db)
                     if args.json:
                         print(json.dumps([{"id": r["id"], "date": r["date"], "source": r["source"],
                                            "event": r["event"], "amount_cents": r["amount"],
-                                           "currency": r["currency"], "description": r["description"]}
+                                           "currency": r["currency"], "description": r["description"],
+                                           "counterparty": r["counterparty"], "impact_kind": r["impact_kind"]}
                                           for r in rows], ensure_ascii=False))
                     else:
                         for r in rows:
-                            print(r["id"], r["date"], money(r["amount"]), r["currency"], r["description"], sep="\t")
+                            print(r["id"], r["date"], money(r["amount"]), r["currency"],
+                                  r["description"] or r["counterparty"], sep="\t")
                 elif args.id is not None and args.kind and args.category:
                     classify_movement(db, args.id, args.kind, args.category)
                     if args.json:
