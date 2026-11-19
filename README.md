@@ -103,10 +103,12 @@ enabled = true
 category = "Transferencias recibidas"
 ```
 
-Estos son los tipos disponibles.
+En `[credit_fallback]`, podés omitir `category` o escribir `category = ""` para clasificar los créditos restantes como `transfer_in` con categoría vacía. Si desactivás el fallback, los créditos que no coincidan con otra regla quedan para revisar.
+
+Estos son los tipos disponibles. Usá `transfer_out` para las transferencias enviadas.
 
 ```text
-purchase  transfer  transfer_in  card_payment  yield  fee  refund  withdrawal  loan  other
+purchase  transfer  transfer_in  transfer_out  card_payment  yield  fee  refund  withdrawal  loan  other
 ```
 
 Después de editar las reglas, ejecutá `mp-gastos reclassify`. El comando usa los datos guardados y respeta las clasificaciones manuales. La base se actualiza automáticamente al abrirla. Para recuperar columnas que la versión anterior descartaba o filas que se habían confundido al importar, cargá de nuevo los CSV originales.
@@ -118,9 +120,12 @@ Primero importá los movimientos. Después ejecutá `mp-gastos import-classifica
 ```csv
 source_id,kind,category
 71005,purchase,Materiales
+84001,transfer_out,Transferencias enviadas
 ```
 
-Usá el `SOURCE_ID` del reporte de MP. La clasificación se aplica a todos los movimientos existentes con ese ID y queda marcada como manual. `sync` y `reclassify` la conservan. Si el CSV incluye un ID desconocido, un tipo inválido, una categoría vacía o clasificaciones contradictorias para un mismo ID, se descarta el lote completo.
+Usá el `SOURCE_ID` del reporte de MP. La clasificación se aplica a todos los movimientos existentes con ese ID y también a las filas nuevas con el mismo ID que aparezcan en un `sync` posterior. Las clasificaciones manuales, cargadas por CSV o con `review`, tienen prioridad sobre las reglas automáticas en `sync` y `reclassify`. Un cambio con `review` se aplica a la fila elegida. Para que las clasificaciones importadas con versiones anteriores también se apliquen a filas nuevas, volvé a importar el CSV.
+
+Si el CSV incluye un ID desconocido, un tipo inválido, una categoría vacía o clasificaciones contradictorias para un mismo ID, se descarta el lote completo.
 
 ## Conciliá con el resumen de tu tarjeta
 

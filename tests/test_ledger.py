@@ -159,6 +159,49 @@ direction = "debit"
             ("72005", "purchase", "Materiales", 1),
         ])
 
+    def test_manual_payout_classifications_take_priority(self):
+        (self.home / "rules.toml").write_text("""
+[[rule]]
+field = "transaction_type"
+exact = "PAYOUT"
+kind = "withdrawal"
+category = "Retiros"
+""", encoding="utf-8")
+        daily = FIXTURE.with_name("settlement-payouts.csv")
+        monthly = FIXTURE.with_name("settlement-payouts-monthly.csv")
+        batch = FIXTURE.with_name("classifications-payouts.csv")
+        self.cli("sync", "--daily-csv", str(daily))
+        self.assertEqual([row[0] for row in self.db.execute("SELECT DISTINCT kind FROM movements")], ["withdrawal"])
+        self.assertIn("manualmente: 1", self.cli("import-classifications", str(batch)))
+        movement = self.db.execute("SELECT id FROM movements WHERE source='84002'").fetchone()[0]
+        self.cli("review", "--id", str(movement), "--kind", "transfer_out", "--category", "Envío manual")
+        self.cli("sync", "--csv", str(monthly))
+        self.assertIn("reclasificados: 0", self.cli("reclassify"))
+        rows = self.db.execute("SELECT source,kind,category,reviewed FROM movements ORDER BY source,amount")
+        self.assertEqual([tuple(row) for row in rows], [
+            ("84001", "transfer_out", "Giros de prueba", 1),
+            ("84001", "transfer_out", "Giros de prueba", 1),
+            ("84002", "transfer_out", "Envío manual", 1),
+            ("84003", "withdrawal", "Retiros", 0),
+        ])
+        data = json.loads(self.cli("report", "--month", "2026-04", "--json"))
+        self.assertEqual(data["totals"], [])
+        self.assertIn({"currency": "ARS", "kind": "transfer_out", "category": "Giros de prueba", "net_cents": -3000},
+                      data["other_movements"])
+
+    def test_credit_fallback_with_empty_category(self):
+        self.cli("sync", "--daily-csv", str(DAILY))
+        rules = self.home / "rules.toml"
+        for category in ('category = "Banco de prueba"', '', 'category = ""', 'category = "  "'):
+            with self.subTest(category=category):
+                rules.write_text(f"[credit_fallback]\nenabled = true\n{category}\n", encoding="utf-8")
+                self.cli("reclassify")
+                data = json.loads(self.cli("report", "--month", "2026-04", "--json"))
+                expected = "Banco de prueba" if "Banco" in category else ""
+                self.assertIn({"currency": "ARS", "kind": "transfer_in", "category": expected, "net_cents": 2000},
+                              data["other_movements"])
+                self.assertFalse(any(row["source"] == "72004" for row in json.loads(self.cli("review", "--json"))))
+
     def test_invalid_classification_batch_rolls_back(self):
         self.cli("sync", "--daily-csv", str(DAILY))
         batch = self.home / "manual.csv"

@@ -12,6 +12,11 @@ MONTHLY, DAILY = 1, 2
 MONTHLY_REPORTS = """
 CREATE TABLE IF NOT EXISTS monthly_reports (month TEXT PRIMARY KEY, end_at TEXT NOT NULL);
 """
+IMPORTED_CLASSIFICATIONS = """
+CREATE TABLE IF NOT EXISTS imported_classifications (
+    source TEXT PRIMARY KEY, kind TEXT NOT NULL, category TEXT NOT NULL
+);
+"""
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS account (slot INTEGER PRIMARY KEY CHECK(slot=1), payer TEXT NOT NULL);
@@ -35,7 +40,7 @@ CREATE TABLE IF NOT EXISTS statement_lines (
     reference TEXT PRIMARY KEY, payment TEXT NOT NULL REFERENCES cards(id),
     amount INTEGER NOT NULL CHECK(amount > 0), currency TEXT NOT NULL
 );
-""" + MONTHLY_REPORTS
+""" + MONTHLY_REPORTS + IMPORTED_CLASSIFICATIONS
 
 
 def initialize(home):
@@ -60,6 +65,8 @@ def database(home, *, create=False):
     try:
         with db:
             _upgrade_movements(db)
+            if not create:
+                db.execute(IMPORTED_CLASSIFICATIONS)
             yield db
     finally:
         db.close()
@@ -140,18 +147,21 @@ def import_reports(db, payloads, rules, *, daily=(), daily_month=None, monthly_e
                 for field in DETAIL_FIELDS:
                     row[field] = row[field] or existing[field]
                 row["report_origin"] |= existing["report_origin"]
-            row["kind"], row["category"] = classify(row, rules)
+            manual = existing if existing and existing["reviewed"] else db.execute(
+                "SELECT kind,category FROM imported_classifications WHERE source=?", (row["source"],)
+            ).fetchone()
+            row["reviewed"] = int(manual is not None)
+            row["kind"], row["category"] = (manual["kind"], manual["category"]) if manual else classify(row, rules)
             db.execute("""
                 INSERT INTO movements(identity,source,date,event,amount,currency,description,external_reference,
-                                      payment_method_type,counterparty,impact_kind,report_origin,kind,category)
+                                      payment_method_type,counterparty,impact_kind,report_origin,kind,category,reviewed)
                 VALUES (:identity,:source,:date,:event,:amount,:currency,:description,:external_reference,
-                        :payment_method_type,:counterparty,:impact_kind,:report_origin,:kind,:category)
+                        :payment_method_type,:counterparty,:impact_kind,:report_origin,:kind,:category,:reviewed)
                 ON CONFLICT(identity) DO UPDATE SET description=excluded.description,
                     external_reference=excluded.external_reference, payment_method_type=excluded.payment_method_type,
                     counterparty=excluded.counterparty, impact_kind=excluded.impact_kind,
                     report_origin=excluded.report_origin,
-                    kind=CASE WHEN reviewed THEN kind ELSE excluded.kind END,
-                    category=CASE WHEN reviewed THEN category ELSE excluded.category END
+                    kind=excluded.kind, category=excluded.category, reviewed=excluded.reviewed
             """, row)
     return months
 
@@ -194,7 +204,7 @@ def classify_movement(db, movement, kind, category):
 
 
 def import_classifications(db, path):
-    """Apply a manual classification to every existing movement with the given source ID."""
+    """Apply and remember a manual classification for each imported source ID."""
     with path.open(encoding="utf-8-sig", newline="") as stream, db:
         reader = csv.DictReader(stream, strict=True)
         if sorted(reader.fieldnames or []) != ["category", "kind", "source_id"]:
@@ -219,6 +229,10 @@ def import_classifications(db, path):
                 raise ValueError(f"Line {line}: unknown source ID.")
             seen[source] = kind, category
             count += result.rowcount
+        db.executemany("""
+            INSERT INTO imported_classifications(source,kind,category) VALUES (?,?,?)
+            ON CONFLICT(source) DO UPDATE SET kind=excluded.kind, category=excluded.category
+        """, ((source, kind, category) for source, (kind, category) in seen.items()))
     return count
 
 

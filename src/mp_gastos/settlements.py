@@ -15,8 +15,8 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 ARGENTINA = timezone(timedelta(hours=-3))
-KINDS = ("purchase", "transfer", "transfer_in", "card_payment", "yield", "fee", "refund", "withdrawal",
-         "loan", "other")
+KINDS = ("purchase", "transfer", "transfer_in", "transfer_out", "card_payment", "yield", "fee", "refund",
+         "withdrawal", "loan", "other")
 REQUIRED = {"SOURCE_ID", "TRANSACTION_DATE", "TRANSACTION_TYPE", "SETTLEMENT_NET_AMOUNT",
             "TRANSACTION_CURRENCY"}
 DETAIL_FIELDS = ("description", "external_reference", "payment_method_type", "counterparty", "impact_kind")
@@ -95,13 +95,15 @@ def load_issuers(path):
     return {str(key): name for key, name in issuers.items()}
 
 
-def _classification_section(config, name, fields, default_category):
+def _classification_section(config, name, fields, default_category, *, allow_empty_category=False):
     section = config.get(name, {})
     if not isinstance(section, dict) or section.keys() - (fields | {"enabled", "category"}):
         raise ValueError(f"Invalid [{name}] section.")
     enabled = section.get("enabled", name in config)
     category = section.get("category", default_category)
-    if not isinstance(enabled, bool) or not isinstance(category, str) or not category.strip():
+    if not isinstance(enabled, bool) or not isinstance(category, str):
+        raise ValueError(f"Expected a boolean enabled and a string category in [{name}].")
+    if not allow_empty_category and not category.strip():
         raise ValueError(f"Expected a boolean enabled and a nonempty category in [{name}].")
     return category.strip() if enabled else None
 
@@ -133,7 +135,7 @@ def load_rules(path):
             raise ValueError("Expected a positive max_amount in [yield_heuristic].")
         heuristic = YieldHeuristic(_clock(section.get("start", "00:00")), _clock(section.get("end", "02:59")),
                                    limit, category)
-    fallback = _classification_section(config, "credit_fallback", set(), "Transferencias recibidas")
+    fallback = _classification_section(config, "credit_fallback", set(), "", allow_empty_category=True)
     return ClassificationRules(rules, heuristic, fallback)
 
 
@@ -171,7 +173,7 @@ def classify(row, rules):
                 in_window = clock >= heuristic.start or clock <= heuristic.end
             if in_window:
                 return "yield", heuristic.category
-    if amount > 0 and rules.credit_fallback:
+    if amount > 0 and rules.credit_fallback is not None:
         return "transfer_in", rules.credit_fallback
     return None, None
 
